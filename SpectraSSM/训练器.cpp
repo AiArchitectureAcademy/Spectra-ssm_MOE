@@ -9,7 +9,7 @@
 namespace SpectraSSM {
 
     训练器::训练器(
-        std::shared_ptr<频域状态空间模型> 模型,
+        std::shared_ptr<频域MoE模型> 模型,
         const 训练配置& 配置)
         : 模型_(模型), 配置_(配置), 当前轮次_(0), 最佳损失_(std::numeric_limits<float>::max()) {
 
@@ -31,43 +31,204 @@ namespace SpectraSSM {
     }
 
     void 训练器::初始化优化器() {
-        auto 参数 = 模型_->获取参数列表();
+        TORCH_INFO("初始化优化器...");
 
+        // 获取模型参数
+        auto 参数列表 = 模型_->获取参数列表();
+
+        if (参数列表.empty()) {
+            TORCH_WARN("模型参数列表为空");
+            return;
+        }
+
+        TORCH_INFO("模型参数数量: ", 参数列表.size());
+
+        // 配置检查
+        if (配置_.学习率 <= 0.0f) {
+            TORCH_WARN("学习率不合法: ", 配置_.学习率, "，使用默认值 0.001");
+            配置_.学习率 = 0.001f;
+        }
+
+        // 根据配置类型初始化相应的优化器
         switch (配置_.优化器类型) {
         case 优化器类型::SGD:
-            优化器_ = std::make_unique<torch::optim::SGD>(
-                参数, torch::optim::SGDOptions(配置_.学习率)
-                .momentum(配置_.动量)
-                .weight_decay(配置_.权重衰减));
+            初始化SGD优化器(参数列表);
             break;
-
         case 优化器类型::Adam:
-            优化器_ = std::make_unique<torch::optim::Adam>(
-                参数, torch::optim::AdamOptions(配置_.学习率)
-                .betas(std::make_tuple(配置_.贝塔1, 配置_.贝塔2))
-                .weight_decay(配置_.权重衰减));
+            初始化Adam优化器(参数列表);
             break;
-
         case 优化器类型::AdamW:
-            优化器_ = std::make_unique<torch::optim::AdamW>(
-                参数, torch::optim::AdamWOptions(配置_.学习率)
-                .betas(std::make_tuple(配置_.贝塔1, 配置_.贝塔2))
-                .weight_decay(配置_.权重衰减));
+            初始化AdamW优化器(参数列表);
             break;
-
         case 优化器类型::RMSprop:
-            优化器_ = std::make_unique<torch::optim::RMSprop>(
-                参数, torch::optim::RMSpropOptions(配置_.学习率)
-                .momentum(配置_.动量)
-                .weight_decay(配置_.权重衰减));
+            初始化RMSprop优化器(参数列表);
             break;
-
         default:
             TORCH_ERROR("不支持的优化器类型: ", static_cast<int>(配置_.优化器类型));
-            throw std::invalid_argument("不支持的优化器类型");
+            throw std::invalid_argument("优化器类型不支持");
+        }
+
+        // 同时初始化 Vulkan GPU 优化器（如果可用）
+        初始化Vulkan优化器();
+
+        TORCH_INFO("优化器初始化完成 - 类型: ", 优化器类型转字符串(配置_.优化器类型));
+    }
+
+    void 训练器::初始化SGD优化器(const std::vector<torch::Tensor>& 参数列表) {
+        TORCH_INFO("初始化 SGD 优化器...");
+        TORCH_INFO("  - 学习率: ", 配置_.学习率);
+        TORCH_INFO("  - 动量: ", 配置_.动量);
+        TORCH_INFO("  - 权重衰减: ", 配置_.权重衰减);
+
+        try {
+            // 创建 PyTorch SGD 优化器
+            torch优化器_ = std::make_unique<torch::optim::SGD>(
+                参数列表,
+                torch::optim::SGDOptions(配置_.学习率)
+                .momentum(配置_.动量)
+                .weight_decay(配置_.权重衰减)
+            );
+
+            // 验证优化器创建成功
+            TORCH_CHECK(torch优化器_ != nullptr, "SGD优化器创建失败");
+            TORCH_CHECK(!torch优化器_->param_groups().empty(), "优化器参数组为空");
+
+            TORCH_INFO("SGD 优化器创建成功");
+
+        }
+        catch (const std::exception& e) {
+            TORCH_ERROR("SGD 优化器初始化失败: ", e.what());
+            throw;
         }
     }
 
+    void 训练器::初始化Adam优化器(const std::vector<torch::Tensor>& 参数列表) {
+        TORCH_INFO("初始化 Adam 优化器...");
+        TORCH_INFO("  - 学习率: ", 配置_.学习率);
+        TORCH_INFO("  - Beta1: ", 配置_.贝塔1);
+        TORCH_INFO("  - Beta2: ", 配置_.贝塔2);
+        TORCH_INFO("  - 权重衰减: ", 配置_.权重衰减);
+
+        try {
+            // 创建 PyTorch Adam 优化器
+            torch优化器_ = std::make_unique<torch::optim::Adam>(
+                参数列表,
+                torch::optim::AdamOptions(配置_.学习率)
+                .betas(std::make_tuple(配置_.贝塔1, 配置_.贝塔2))
+                .weight_decay(配置_.权重衰减)
+                .epsilon(1e-8)
+            );
+
+            TORCH_CHECK(torch优化器_ != nullptr, "Adam优化器创建失败");
+            TORCH_CHECK(!torch优化器_->param_groups().empty(), "优化器参数组为空");
+
+            TORCH_INFO("Adam 优化器创建成功");
+
+        }
+        catch (const std::exception& e) {
+            TORCH_ERROR("Adam 优化器初始化失败: ", e.what());
+            throw;
+        }
+    }
+
+    void 训练器::初始化AdamW优化器(const std::vector<torch::Tensor>& 参数列表) {
+        TORCH_INFO("初始化 AdamW 优化器...");
+        TORCH_INFO("  - 学习率: ", 配置_.学习率);
+        TORCH_INFO("  - Beta1: ", 配置_.贝塔1);
+        TORCH_INFO("  - Beta2: ", 配置_.贝塔2);
+        TORCH_INFO("  - 权重衰减: ", 配置_.权重衰减);
+
+        try {
+            // 创建 PyTorch AdamW 优化器
+            torch优化器_ = std::make_unique<torch::optim::AdamW>(
+                参数列表,
+                torch::optim::AdamWOptions(配置_.学习率)
+                .betas(std::make_tuple(配置_.贝塔1, 配置_.贝塔2))
+                .weight_decay(配置_.权重衰减)
+                .epsilon(1e-8)
+            );
+
+            TORCH_CHECK(torch优化器_ != nullptr, "AdamW优化器创建失败");
+            TORCH_CHECK(!torch优化器_->param_groups().empty(), "优化器参数组为空");
+
+            TORCH_INFO("AdamW 优化器创建成功");
+
+        }
+        catch (const std::exception& e) {
+            TORCH_ERROR("AdamW 优化器初始化失败: ", e.what());
+            throw;
+        }
+    }
+
+    void 训练器::初始化RMSprop优化器(const std::vector<torch::Tensor>& 参数列表) {
+        TORCH_INFO("初始化 RMSprop 优化器...");
+        TORCH_INFO("  - 学习率: ", 配置_.学习率);
+        TORCH_INFO("  - 动量: ", 配置_.动量);
+        TORCH_INFO("  - 权重衰减: ", 配置_.权重衰减);
+
+        try {
+            // 创建 PyTorch RMSprop 优化器
+            torch优化器_ = std::make_unique<torch::optim::RMSprop>(
+                参数列表,
+                torch::optim::RMSpropOptions(配置_.学习率)
+                .momentum(配置_.动量)
+                .weight_decay(配置_.权重衰减)
+                .eps(1e-8)
+            );
+
+            TORCH_CHECK(torch优化器_ != nullptr, "RMSprop优化器创建失败");
+            TORCH_CHECK(!torch优化器_->param_groups().empty(), "优化器参数组为空");
+
+            TORCH_INFO("RMSprop 优化器创建成功");
+
+        }
+        catch (const std::exception& e) {
+            TORCH_ERROR("RMSprop 优化器初始化失败: ", e.what());
+            throw;
+        }
+    }
+
+    void 训练器::初始化Vulkan优化器() {
+        TORCH_INFO("初始化 Vulkan GPU 优化器...");
+
+        try {
+            // 检查是否有可用的 GPU
+            if (!torch::cuda::is_available()) {
+                TORCH_WARN("CUDA 不可用，Vulkan 优化器将回退到 CPU");
+            }
+
+            // 创建 Vulkan Adam 优化器
+            auto vulkanAdam = std::make_shared<VulkanAdam优化器>(
+                配置_.学习率,
+                配置_.贝塔1,
+                配置_.贝塔2,
+                配置_.权重衰减,
+                1e-8f,
+                0  // 使用默认 GPU
+            );
+
+            vulkan优化器_ = vulkanAdam;
+
+            TORCH_INFO("Vulkan GPU 优化器创建成功");
+
+        }
+        catch (const std::exception& e) {
+            TORCH_WARN("Vulkan 优化器初始化失败: ", e.what(),
+                "，将仅使用 PyTorch CPU 优化器");
+            vulkan优化器_ = nullptr;
+        }
+    }
+
+    // 以下是优化器类型转换函数，用于日志输出
+    std::string 训练器::优化器类型转字符串(优化器类型 类型) {
+        switch (类型) {
+        case 优化器类型::SGD: return "SGD";
+        case 优化器类型::Adam: return "Adam";
+        case 优化器类型::AdamW: return "AdamW";
+        case 优化器类型::RMSprop: return "RMSprop";
+        default: return "未知优化器";
+        }
+    }
     float 训练器::训练步骤(const torch::Tensor& 输入, const torch::Tensor& 目标) {
         // 设置模型为训练模式
         模型_->train();
@@ -126,23 +287,57 @@ namespace SpectraSSM {
     }
 
     void 训练器::设置学习率(float 新学习率) {
-        for (auto& 参数组 : 优化器_->param_groups()) {
-            if (参数组.has_options()) {
-                auto& 选项 = 参数组.options();
-                if (auto* sgd选项 = dynamic_cast<torch::optim::SGDOptions*>(&选项)) {
-                    sgd选项->lr(新学习率);
+        // 验证学习率合理性
+        if (新学习率 <= 0.0f || 新学习率 > 1.0f) {
+            TORCH_WARN("警告: 学习率 ", 新学习率, " 超出合理范围 (0, 1]，使用当前值: ", 配置_.学习率);
+            return;
+        }
+
+        // 记录旧值
+        float 旧学习率 = 配置_.学习率;
+        配置_.学习率 = 新学习率;
+
+        TORCH_INFO("设置学习率: ", 旧学习率, " -> ", 新学习率);
+
+        // 1. 更新 PyTorch 优化器
+        if (torch优化器_ && !torch优化器_->param_groups().empty()) {
+            try {
+                for (auto& 参数组 : torch优化器_->param_groups()) {
+                    auto& 选项 = 参数组.options();
+
+                    if (auto* sgd选项 = dynamic_cast<torch::optim::SGDOptions*>(&选项)) {
+                        sgd选项->lr(新学习率);
+                    }
+                    else if (auto* adam选项 = dynamic_cast<torch::optim::AdamOptions*>(&选项)) {
+                        adam选项->lr(新学习率);
+                    }
+                    else if (auto* adamw选项 = dynamic_cast<torch::optim::AdamWOptions*>(&选项)) {
+                        adamw选项->lr(新学习率);
+                    }
+                    else if (auto* rmsprop选项 = dynamic_cast<torch::optim::RMSpropOptions*>(&选项)) {
+                        rmsprop选项->lr(新学习率);
+                    }
                 }
-                else if (auto* adam选项 = dynamic_cast<torch::optim::AdamOptions*>(&选项)) {
-                    adam选项->lr(新学习率);
-                }
-                else if (auto* adamw选项 = dynamic_cast<torch::optim::AdamWOptions*>(&选项)) {
-                    adamw选项->lr(新学习率);
-                }
-                else if (auto* rmsprop选项 = dynamic_cast<torch::optim::RMSpropOptions*>(&选项)) {
-                    rmsprop选项->lr(新学习率);
-                }
+                TORCH_INFO("  - PyTorch 优化器学习率已同步");
+            }
+            catch (const std::exception& e) {
+                TORCH_ERROR("  - 更新 PyTorch 优化器失败: ", e.what());
             }
         }
+
+        // 2. 更新 Vulkan 优化器
+        if (vulkan优化器_) {
+            try {
+                vulkan优化器_->设置学习率(新学习率);
+                TORCH_INFO("  - Vulkan GPU 优化器学习率已同步");
+            }
+            catch (const std::exception& e) {
+                TORCH_ERROR("  - 更新 Vulkan 优化器失败: ", e.what());
+            }
+        }
+
+        // 3. 更新训练统计
+        训练统计_["学习率"] = 新学习率;
     }
 
     void 训练器::保存检查点(int64_t 轮次, float 损失) {

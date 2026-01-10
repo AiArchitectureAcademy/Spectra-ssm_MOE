@@ -8,42 +8,47 @@
 #include <algorithm>
 #include <numeric>
 #include <fstream>
+#include <filesystem>
 
 namespace SpectraSSM {
 
 // ========================= 频域MoE分类器实现 =========================
 
-频域MoE分类器::频域MoE分类器(int64_t 输入维度, int64_t 类别数, 
-                           const 频域MoE配置& 配置)
-    : 输入维度_(输入维度), 类别数_(类别数), 配置_(配置) {
-    
-    // 初始化专家网络
-    初始化专家网络();
-    
-    // 初始化门控网络
-    初始化门控网络();
-    
-    // 初始化输出层
-    输出层_ = register_module("输出层",
-        torch::nn::Linear(配置_.专家隐藏维度, 类别数_));
-    
-    // 初始化专家专业化
-    if (配置_.启用频域专业化) {
-        初始化专家专业化();
+    频域MoE分类器::频域MoE分类器(int64_t 输入维度, int64_t 类别数,
+        const 频域MoE配置& 配置)
+        : 输入维度_(输入维度), 类别数_(类别数), 配置_(配置) {
+
+        // 初始化专家网络
+        初始化专家网络();
+
+        // 初始化门控网络
+        初始化门控网络();
+
+        // 初始化输出层
+        输出层_ = register_module("输出层",
+            torch::nn::Linear(配置_.专家隐藏维度, 类别数_));
+
+        // 初始化专家专业化
+        if (配置_.启用频域专业化) {
+            初始化专家专业化();
+        }
+
+        // 初始化使用统计
+        专家使用统计_ = register_buffer("专家使用统计",
+            torch::zeros({ 配置_.专家数量 }, torch::kFloat32));
+
+        // 关键修复：初始化路由概率缓存
+        最后路由概率_ = register_buffer("最后路由概率",
+            torch::zeros({ 0 }, torch::kFloat32)); // 初始化为空
+
+        TORCH_INFO("频域MoE分类器初始化完成: 输入维度=", 输入维度_,
+            ", 类别数=", 类别数_, ", 专家数=", 配置_.专家数量);
     }
-    
-    // 初始化使用统计
-    专家使用统计_ = register_buffer("专家使用统计", 
-        torch::zeros({配置_.专家数量}, torch::kFloat32));
-    
-    TORCH_INFO("频域MoE分类器初始化完成: 输入维度=", 输入维度_, 
-               ", 类别数=", 类别数_, ", 专家数=", 配置_.专家数量);
-}
 
 void 频域MoE分类器::初始化专家网络() {
     for (int64_t i = 0; i < 配置_.专家数量; ++i) {
-        // 创建专家网络（小型频域状态空间模型）
-        auto 专家 = std::make_shared<频域状态空间模型>(
+        // 创建专家网络（小型频域MoE模型）
+        auto 专家 = std::make_shared<频域MoE模型>(
             输入维度_, 配置_.专家隐藏维度, /*最大序列长度=*/1024);
         
         专家网络_.push_back(专家);
@@ -199,36 +204,41 @@ void 频域MoE分类器::更新使用统计(const torch::Tensor& 门控权重) {
 torch::Tensor 频域MoE分类器::前向传播(const torch::Tensor& 输入) {
     auto 批次大小 = 输入.size(0);
     auto 序列长度 = 输入.size(1);
-    
+
     // 检查输入维度
-    TORCH_CHECK(输入.size(2) == 输入维度_, 
-                "输入维度不匹配: 期望=", 输入维度_, ", 实际=", 输入.size(2));
-    
-    // 1. 计算门控权重
+    TORCH_CHECK(输入.size(2) == 输入维度_,
+        "输入维度不匹配: 期望=", 输入维度_, ", 实际=", 输入.size(2));
+
+    // 1. 计算门控权重并缓存
     auto 门控权重 = 计算门控权重(输入);  // [batch_size, expert_count]
-    
+
+    // 关键修复：缓存路由概率用于训练器
+    最后路由概率_ = 门控权重.detach().clone(); // 分离计算图并克隆
+
     // 2. 并行计算专家输出（使用缓存优化）
     std::vector<torch::Tensor> 专家输出列表;
     bool 使用缓存 = 配置_.启用专家缓存 && !is_training();
-    
+
     if (使用缓存 && 当前缓存序列长度_ == 序列长度 && 当前缓存输入_.defined() &&
         torch::equal(输入, 当前缓存输入_)) {
         // 使用缓存结果
         for (int64_t i = 0; i < 配置_.专家数量; ++i) {
             if (专家输出缓存_.find(i) != 专家输出缓存_.end()) {
                 专家输出列表.push_back(专家输出缓存_[i]);
-            } else {
+            }
+            else {
                 auto 专家输出 = 专家网络_[i]->前向传播(输入);
                 专家输出缓存_[i] = 专家输出;
                 专家输出列表.push_back(专家输出);
             }
         }
-    } else {
+    }
+    else {
         // 重新计算专家输出
         清空专家缓存();
         当前缓存序列长度_ = 序列长度;
         当前缓存输入_ = 输入.clone();
-        
+
         for (int64_t i = 0; i < 配置_.专家数量; ++i) {
             auto 专家输出 = 专家网络_[i]->前向传播(输入);
             if (使用缓存) {
@@ -237,59 +247,49 @@ torch::Tensor 频域MoE分类器::前向传播(const torch::Tensor& 输入) {
             专家输出列表.push_back(专家输出);
         }
     }
-    
+
     // 3. 加权融合专家输出
-    torch::Tensor 融合输出 = torch::zeros({批次大小, 序列长度, 配置_.专家隐藏维度}, 
-                                        输入.options());
-    
+    torch::Tensor 融合输出 = torch::zeros({ 批次大小, 序列长度, 配置_.专家隐藏维度 },
+        输入.options());
+
     for (int64_t i = 0; i < 配置_.专家数量; ++i) {
         auto 专家贡献 = 门控权重.select(1, i)  // [batch_size]
-                         .unsqueeze(-1)        // [batch_size, 1]
-                         .unsqueeze(-1)        // [batch_size, 1, 1]
-                         .expand({批次大小, 序列长度, 配置_.专家隐藏维度});
-        
+            .unsqueeze(-1)        // [batch_size, 1]
+            .unsqueeze(-1)        // [batch_size, 1, 1]
+            .expand({ 批次大小, 序列长度, 配置_.专家隐藏维度 });
+
         融合输出 += 专家贡献 * 专家输出列表[i];
     }
-    
+
     // 4. 分类输出
     auto 最终输出 = 输出层_->forward(融合输出);  // [batch_size, seq_len, num_classes]
-    
+
     return 最终输出;
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> 
-频域MoE分类器::计算路由损失() {
-    if (统计更新次数_ == 0) {
-        return std::make_tuple(
-            torch::tensor(0.0f), 
-            torch::tensor(0.0f), 
-            torch::tensor(0.0f));
-    }
-    
-    auto 设备 = 专家使用统计_.device();
-    
-    // 1. 重要性损失：鼓励均匀使用专家
-    auto 目标分布 = torch::ones({配置_.专家数量}, 设备) / 配置_.专家数量;
-    auto 重要性损失 = torch::nn::functional::kl_div(
-        torch::log_softmax(专家使用统计_, 0),
-        torch::softmax(目标分布, 0),
-        torch::nn::KLDivLossFuncOptions().reduction(torch::kMean)
-    ) * 配置_.负载均衡权重;
-    
-    // 2. 负载损失：防止单个专家过载
-    auto 平均负载 = 专家使用统计_.mean();
-    auto 负载差异 = 专家使用统计_ - 平均负载;
-    auto 负载损失 = torch::mean(负载差异 * 负载差异) * 配置_.负载均衡权重;
-    
-    // 3. 专业化损失：鼓励专家输出差异化
-    torch::Tensor 专业化损失 = torch::tensor(0.0f, 设备);
-    if (配置_.专业化权重 > 0 && 配置_.专家数量 > 1) {
-        // 简化实现：计算专家输出的负相关性
-        // 实际中可以采样计算专家输出的相关性矩阵
-        专业化损失 = torch::tensor(0.0f, 设备); // 占位符
-    }
-    
-    return std::make_tuple(重要性损失, 负载损失, 专业化损失);
+torch::Tensor 频域MoE分类器::计算路由损失(const torch::Tensor& 路由概率) {
+    // 验证输入维度
+    TORCH_CHECK(路由概率.dim() == 2, "路由概率张量维度必须为2");
+
+    const int64_t 批大小 = 路由概率.size(0);
+    const int64_t 专家数量 = 路由概率.size(1);
+
+    // 生成均匀分布目标，自动匹配批大小和设备类型
+    const auto 均匀分布目标 = torch::full(
+        { 批大小, 专家数量 },
+        1.0f / 专家数量,
+        torch::TensorOptions().device(路由概率.device()).dtype(路由概率.dtype())
+    );
+
+    // 计算对数概率，作为kl_div的输入
+    const auto 对数路由概率 = torch::log_softmax(路由概率, /*dim=*/1);
+
+    // 计算路由分布与均匀分布的KL散度，促进负载均衡
+    return torch::nn::functional::kl_div(
+        对数路由概率,
+        均匀分布目标,
+        torch::nn::functional::KLDivFuncOptions().reduction(torch::kMean)
+    );
 }
 
 torch::Tensor 频域MoE分类器::获取专家使用统计() const {
@@ -335,33 +335,40 @@ void 频域MoE分类器::清空专家缓存() {
 }
 
 torch::Tensor 频域MoE训练器::训练步骤(const torch::Tensor& 输入, const torch::Tensor& 标签) {
+    // 设置模型为训练模式
     模型_->train();
-    
-    // 移动数据到设备
+
+    // 确保输入标签维度正确
     auto 输入设备 = 输入.to(设备_);
     auto 标签设备 = 标签.to(设备_);
-    
-    // 前向传播
+
+    // 前向传播（这会自动缓存路由概率）
     auto 输出 = 模型_->前向传播(输入设备);
-    
-    // 计算损失
-    auto 总损失 = 计算总损失(输出, 标签设备);
-    
+
+    // 动态处理输出维度
+    auto 输出展平 = 输出.reshape({ -1, 输出.size(-1) });
+    auto 标签展平 = 标签设备.reshape({ -1 });
+
+    // 计算总损失
+    auto 总损失 = 计算总损失(输出展平, 标签展平);
+
     // 反向传播
     优化器_->zero_grad();
     总损失.backward();
-    
-    // 梯度裁剪（防止MoE训练不稳定）
-    torch::nn::utils::clip_grad_norm_(模型_->parameters(), 1.0);
-    
+
+    // 梯度裁剪
+    float 梯度范数 = 计算梯度范数();
+    if (梯度范数 > 配置_.最大梯度范数) {
+        torch::nn::utils::clip_grad_norm_(模型_->parameters(), 配置_.最大梯度范数);
+        TORCH_WARN("梯度裁剪应用: ", 梯度范数, " -> ", 配置_.最大梯度范数);
+    }
+
     // 参数更新
     优化器_->step();
-    
-    // 更新训练统计
+
+    // 更新训练步数
     训练步数_++;
-    训练统计_["总损失"] = 总损失.item<float>();
-    训练统计_["训练步数"] = 训练步数_;
-    
+
     return 总损失;
 }
 
@@ -387,25 +394,81 @@ std::tuple<torch::Tensor, torch::Tensor>
     return std::make_tuple(损失, 预测);
 }
 
-torch::Tensor 频域MoE训练器::计算总损失(const torch::Tensor& 输出, const torch::Tensor& 标签) {
-    // 分类损失
-    auto 分类损失 = torch::nn::functional::cross_entropy_loss(
-        输出.view({-1, 输出.size(-1)}), 
-        标签.view({-1}),
-        torch::nn::CrossEntropyLossFuncOptions().reduction(torch::kMean)
+torch::Tensor 频域MoE训练器::计算总损失(
+    const torch::Tensor& 预测输出,
+    const torch::Tensor& 真实标签
+) {
+    // 验证路由概率是否已正确缓存
+    TORCH_CHECK(模型_->获取最后路由概率().defined(),
+        "错误: 必须先执行前向传播才能获取路由概率");
+
+    const auto& 路由概率 = 模型_->获取最后路由概率();
+
+    // 动态处理维度以适应不同类型任务
+    auto 预测展平 = 预测输出.reshape({ -1, 预测输出.size(-1) });
+    auto 标签展平 = 真实标签.reshape({ -1 });
+
+    // 验证设备一致性
+    TORCH_CHECK(
+        预测展平.device() == 标签展平.device() &&
+        预测展平.device() == 路由概率.device(),
+        "所有张量必须位于同一设备上"
     );
-    
-    // MoE路由损失
-    auto [重要性损失, 负载损失, 专业化损失] = 模型_->计算路由损失();
-    
-    auto 总损失 = 分类损失 + 重要性损失 + 负载损失 + 专业化损失;
-    
-    // 记录各项损失
+
+    // 验证维度匹配
+    TORCH_CHECK(预测展平.size(0) == 标签展平.size(0),
+        "预测和标签样本数量不匹配");
+
+    TORCH_CHECK(路由概率.dim() == 2,
+        "路由概率必须为2维 [批大小, 专家数]");
+
+    TORCH_CHECK(预测展平.size(0) == 路由概率.size(0),
+        "批大小不匹配: 预测=", 预测展平.size(0),
+        ", 路由=", 路由概率.size(0));
+
+    const int64_t 批大小 = 路由概率.size(0);
+    const int64_t 专家数量 = 路由概率.size(1);
+
+    // 1. 分类交叉熵损失
+    auto 分类损失 = torch::nn::functional::cross_entropy(
+        预测展平,
+        标签展平,
+        torch::nn::functional::CrossEntropyFuncOptions()
+        .reduction(torch::kMean)
+    );
+
+    // 2. 路由均衡损失 (KL散度)
+    const auto 均匀目标 = torch::full(
+        { 批大小, 专家数量 },
+        1.0f / 专家数量,
+        torch::TensorOptions()
+        .device(路由概率.device())
+        .dtype(路由概率.dtype())
+    );
+
+    const auto 对数路由概率 = torch::log_softmax(路由概率, /*dim=*/1);
+
+    auto 路由损失 = torch::nn::functional::kl_div(
+        对数路由概率,
+        均匀目标,
+        torch::nn::functional::KLDivFuncOptions()
+        .reduction(torch::kMean)
+        .log_target(false)
+    );
+
+    // 3. 组合损失权重（可配置）
+    const float 路由损失权重 = 0.01f;
+    auto 总损失 = 分类损失 + 路由损失权重 * 路由损失;
+
+    // 记录损失用于监控
     训练统计_["分类损失"] = 分类损失.item<float>();
-    训练统计_["重要性损失"] = 重要性损失.item<float>();
-    训练统计_["负载损失"] = 负载损失.item<float>();
-    训练统计_["专业化损失"] = 专业化损失.item<float>();
-    
+    训练统计_["路由损失"] = 路由损失.item<float>();
+    训练统计_["总损失"] = 总损失.item<float>();
+
+    TORCH_INFO("损失计算完成: 分类损失=", 分类损失.item<float>(),
+        ", 路由损失=", 路由损失.item<float>(),
+        ", 总损失=", 总损失.item<float>());
+
     return 总损失;
 }
 
@@ -452,18 +515,7 @@ torch::Tensor 频域MoE分析器::生成路由热力图(const torch::Tensor& 输
     // 获取门控权重
     return 模型_->获取门控权重(输入样本);
 }
-// ============================================================
-// SpectraSSM_MoE_Trainer.cpp - 频域MoE训练器完整实现
-// 文件名: SpectraSSM_MoE_Trainer.cpp
-// ============================================================
 
-#include "SpectraSSM_MoE.hpp"
-#include <torch/torch.h>
-#include <fstream>
-#include <iomanip>
-#include <chrono>
-
-namespace SpectraSSM {
 
 // ========================= 频域MoE训练器实现 =========================
 
@@ -491,142 +543,82 @@ namespace SpectraSSM {
     TORCH_INFO("频域MoE训练器初始化完成，设备: ", 设备_);
 }
 
-torch::Tensor 频域MoE训练器::训练步骤(const torch::Tensor& 输入, const torch::Tensor& 标签) {
-    // 设置模型为训练模式
-    模型_->train();
-    
-    // 确保输入标签维度正确
-    auto 标签设备 = 标签.to(设备_);
-    if (标签设备.dim() == 3) {
-        // 如果是序列标签，展平
-        标签设备 = 标签设备.view({-1});
-    }
-    
-    // 前向传播
-    auto 输出 = 模型_->前向传播(输入.to(设备_));
-    
-    // 确保输出维度匹配标签
-    auto 输出展平 = 输出.reshape({-1, 输出.size(-1)});
-    
-    // 计算总损失
-    auto 总损失 = 计算总损失(输出展平, 标签设备);
-    
-    // 反向传播
-    优化器_->zero_grad();
-    总损失.backward();
-    
-    // 计算梯度范数（用于监控）
-    float 梯度范数 = 计算梯度范数();
-    训练统计_["梯度范数"] = 梯度范数;
-    
-    // 梯度裁剪（MoE训练需要更严格的梯度控制）
-    if (梯度范数 > 配置_.最大梯度范数) {
-        torch::nn::utils::clip_grad_norm_(模型_->parameters(), 配置_.最大梯度范数);
-        TORCH_WARN("梯度裁剪应用: ", 梯度范数, " -> ", 配置_.最大梯度范数);
-    }
-    
-    // 参数更新
-    优化器_->step();
-    
-    // 更新学习率统计
-    更新学习率统计();
-    
-    // 更新训练步数
-    训练步数_++;
-    
-    // 定期记录专家使用情况
-    if (训练步数_ % 配置_.统计记录间隔 == 0) {
-        记录专家统计();
-    }
-    
-    // 定期保存检查点
-    if (配置_.检查点间隔 > 0 && 训练步数_ % 配置_.检查点间隔 == 0) {
-        保存检查点(配置_.检查点目录 + "/checkpoint_step_" + std::to_string(训练步数_) + ".pt");
-    }
-    
-    return 总损失;
-}
 
-std::tuple<torch::Tensor, torch::Tensor, std::unordered_map<std::string, float>> 
-频域MoE训练器::验证步骤(const torch::Tensor& 输入, const torch::Tensor& 标签) {
-    // 设置模型为评估模式
-    模型_->eval();
-    
-    torch::NoGradGuard no_grad;
-    
-    auto 输入设备 = 输入.to(设备_);
-    auto 标签设备 = 标签.to(设备_);
-    
-    if (标签设备.dim() == 3) {
-        标签设备 = 标签设备.view({-1});
-    }
-    
-    // 前向传播
-    auto 输出 = 模型_->前向传播(输入设备);
-    auto 输出展平 = 输出.reshape({-1, 输出.size(-1)});
-    
-    // 计算损失
-	auto 损失 = 计算总损失(输出展平, 标签设备);
-    
-    // 计算准确率
-    auto 预测 = torch::argmax(输出展平, -1);
-    auto 正确 = (预测 == 标签设备).to(torch::kFloat32);
-    auto 准确率 = 正确.sum().item<float>() / 正确.numel();
-    
-    // 计算其他指标
-    std::unordered_map<std::string, float> 指标;
-    指标["损失"] = 损失.item<float>();
-    指标["准确率"] = 准确率;
-    
-    // 计算专家使用统计
-    auto 专家使用统计 = 模型_->获取专家使用统计();
-    指标["专家使用熵"] = 计算专家熵(专家使用统计).item<float>();
-    指标["激活专家方差"] = 专家使用统计.var().item<float>();
-    
-    // 更新验证统计
-    验证统计_["损失"] = 指标["损失"];
-    验证统计_["准确率"] = 指标["准确率"];
-    验证统计_["专家使用熵"] = 指标["专家使用熵"];
-    
-    return std::make_tuple(损失, 预测, 指标);
-}
+torch::Tensor 频域MoE训练器::计算总损失(
+    const torch::Tensor& 预测输出,
+    const torch::Tensor& 真实标签
+) {
+    // 验证路由概率是否已正确缓存
+    TORCH_CHECK(模型_->获取最后路由概率().defined(),
+        "错误: 必须先执行前向传播才能获取路由概率");
 
-torch::Tensor 频域MoE训练器::计算总损失(const torch::Tensor& 输出, const torch::Tensor& 标签) {
-    TORCH_CHECK(输出.size(0) == 标签.size(0), 
-                "输出和标签批次大小不匹配");
-    
-    // 1. 分类损失（带标签平滑）
-    auto 分类损失 = torch::nn::functional::cross_entropy_loss(
-        输出, 
-        标签,
-        torch::nn::CrossEntropyLossFuncOptions()
-            .reduction(torch::kMean)
-            .label_smoothing(配置_.标签平滑)
+    const auto& 路由概率 = 模型_->获取最后路由概率();
+
+    // 动态处理维度以适应不同类型任务
+    auto 预测展平 = 预测输出.reshape({ -1, 预测输出.size(-1) });
+    auto 标签展平 = 真实标签.reshape({ -1 });
+
+    // 验证设备一致性
+    TORCH_CHECK(
+        预测展平.device() == 标签展平.device() &&
+        预测展平.device() == 路由概率.device(),
+        "所有张量必须位于同一设备上"
     );
-    
-    // 2. MoE路由损失
-    auto [重要性损失, 负载损失, 专业化损失] = 模型_->计算路由损失();
-    
-    // 3. 正则化损失（从优化器获取）
-    float 正则化损失值 = 0.0f;
-    if (auto adam优化器 = std::dynamic_pointer_cast<torch::optim::Adam>(优化器_)) {
-        // Adam优化器自带L2正则化
-        正则化损失值 = 0.0f; // 已经包含在优化器中
-    }
-    
-    // 4. 总损失
-    auto 总损失 = 分类损失 + 重要性损失 + 负载损失 + 专业化损失;
-    
-    // 记录各项损失
-    训练统计_["总损失"] = 总损失.item<float>();
+
+    // 验证维度匹配
+    TORCH_CHECK(预测展平.size(0) == 标签展平.size(0),
+        "预测和标签样本数量不匹配");
+
+    TORCH_CHECK(路由概率.dim() == 2,
+        "路由概率必须为2维 [批大小, 专家数]");
+
+    TORCH_CHECK(预测展平.size(0) == 路由概率.size(0),
+        "批大小不匹配: 预测=", 预测展平.size(0),
+        ", 路由=", 路由概率.size(0));
+
+    const int64_t 批大小 = 路由概率.size(0);
+    const int64_t 专家数量 = 路由概率.size(1);
+
+    // 1. 分类交叉熵损失
+    auto 分类损失 = torch::nn::functional::cross_entropy(
+        预测展平,
+        标签展平,
+        torch::nn::functional::CrossEntropyFuncOptions()
+        .reduction(torch::kMean)
+    );
+
+    // 2. 路由均衡损失 (KL散度)
+    const auto 均匀目标 = torch::full(
+        { 批大小, 专家数量 },
+        1.0f / 专家数量,
+        torch::TensorOptions()
+        .device(路由概率.device())
+        .dtype(路由概率.dtype())
+    );
+
+    const auto 对数路由概率 = torch::log_softmax(路由概率, /*dim=*/1);
+
+    auto 路由损失 = torch::nn::functional::kl_div(
+        对数路由概率,
+        均匀目标,
+        torch::nn::functional::KLDivFuncOptions()
+        .reduction(torch::kMean)
+        .log_target(false)
+    );
+
+    // 3. 组合损失权重（可配置）
+    const float 路由损失权重 = 0.01f;
+    auto 总损失 = 分类损失 + 路由损失权重 * 路由损失;
+
+    // 记录损失用于监控
     训练统计_["分类损失"] = 分类损失.item<float>();
-    训练统计_["重要性损失"] = 重要性损失.item<float>();
-    训练统计_["负载损失"] = 负载损失.item<float>();
-    训练统计_["专业化损失"] = 专业化损失.item<float>();
-    
-    // 损失权重调整（自适应）
-    自适应损失权重调整();
-    
+    训练统计_["路由损失"] = 路由损失.item<float>();
+    训练统计_["总损失"] = 总损失.item<float>();
+
+    TORCH_INFO("损失计算完成: 分类损失=", 分类损失.item<float>(),
+        ", 路由损失=", 路由损失.item<float>(),
+        ", 总损失=", 总损失.item<float>());
+
     return 总损失;
 }
 
@@ -643,20 +635,40 @@ float 频域MoE训练器::计算梯度范数() {
 }
 
 void 频域MoE训练器::更新学习率统计() {
-    // 尝试从优化器获取当前学习率
-    if (auto adam优化器 = std::dynamic_pointer_cast<torch::optim::Adam>(优化器_)) {
-        // 对于Adam优化器，我们需要访问其参数组
-        auto& 参数组 = adam优化器->param_groups();
-        if (!参数组.empty()) {
-            auto 选项 = 参数组[0].options();
-            if (选项.has_defaults() && 选项.defaults().has_value()) {
-                auto 默认选项 = 选项.defaults().value();
-                if (默认选项.find("lr") != 默认选项.end()) {
-                    训练统计_["学习率"] = std::any_cast<float>(默认选项["lr"]);
-                }
+    try {
+        float 当前学习率 = 获取默认学习率();
+        训练统计_["学习率"] = 当前学习率;
+        TORCH_INFO("当前学习率: ", 当前学习率);
+    }
+    catch (const std::exception& e) {
+        TORCH_ERROR("更新学习率统计失败: ", e.what());
+        训练统计_["学习率"] = 0.001f;
+    }
+}
+
+float 频域MoE训练器::获取默认学习率() {
+    try {
+        if (!优化器_->param_groups().empty()) {
+            auto& 参数组 = 优化器_->param_groups()[0];
+            auto& 选项 = 参数组.options();
+
+            // 通过类型名称判断优化器类型
+            std::string 选项类型名称 = typeid(选项).name();
+
+            if (选项类型名称.find("AdamOptions") != std::string::npos) {
+                auto& adam选项 = static_cast<torch::optim::AdamOptions&>(选项);
+                return adam选项.lr();
+            }
+            else if (选项类型名称.find("SGDOptions") != std::string::npos) {
+                auto& sgd选项 = static_cast<torch::optim::SGDOptions&>(选项);
+                return sgd选项.lr();
             }
         }
     }
+    catch (...) {
+        // 忽略异常，返回默认值
+    }
+    return 0.001f;
 }
 
 void 频域MoE训练器::记录专家统计() {

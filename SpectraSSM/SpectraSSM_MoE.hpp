@@ -7,13 +7,19 @@
 
 #include "SpectraSSM.hpp"
 #include <torch/torch.h>
+#include <torch/optim/optimizer.h>
+#include <torch/optim/adam.h>
+#include <torch/optim/sgd.h>
 #include <torch/nn.h>
 #include <vector>
 #include <unordered_map>
 #include <string>
 #include <memory>
 #include <cmath>
-
+#include <any>
+#include <fstream>
+#include <iomanip>
+#include <chrono>
 namespace SpectraSSM {
 
 /**
@@ -71,12 +77,6 @@ struct 分析配置 {
 /**
  * @class 频域MoE分类器
  * @brief 基于频域特征路由的混合专家分类器
- * 
- * 核心特性：
- * - 频域特征驱动的智能专家路由
- * - 动态专家激活机制，适应不同序列长度
- * - 负载均衡与专业化损失，确保专家差异化
- * - 频域状态空间模型专家网络
  */
 class 频域MoE分类器 : public torch::nn::Module {
 public:
@@ -86,8 +86,8 @@ public:
      * @param 类别数 分类类别数量
      * @param 配置 MoE配置参数
      */
-    频域MoE分类器(int64_t 输入维度, int64_t 类别数, 
-                 const 频域MoE配置& 配置 = 频域MoE配置{});
+    频域MoE分类器(int64_t 输入维度, int64_t 类别数,
+        const 频域MoE配置& 配置 = 频域MoE配置{});
 
     /**
      * @brief 前向传播
@@ -98,9 +98,9 @@ public:
 
     /**
      * @brief 计算路由相关损失
-     * @return 元组包含(重要性损失, 负载损失, 专业化损失)
+     * @return 路由损失张量
      */
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> 计算路由损失();
+    torch::Tensor 计算路由损失(const torch::Tensor& 路由概率);
 
     /**
      * @brief 获取专家使用统计
@@ -114,6 +114,16 @@ public:
      * @return 门控权重矩阵 [批大小, 专家数量]
      */
     torch::Tensor 获取门控权重(const torch::Tensor& 输入);
+
+    /**
+     * @brief 获取最后的路由概率（用于训练器）
+     * @return 路由概率矩阵 [批大小, 专家数量]
+     */
+    const torch::Tensor& 获取最后路由概率() const {
+        TORCH_CHECK(最后路由概率_.defined() && 最后路由概率_.numel() > 0,
+            "错误: 必须先执行前向传播才能获取路由概率");
+        return 最后路由概率_;
+    }
 
     /**
      * @brief 重置专家缓存
@@ -136,14 +146,14 @@ private:
     频域MoE配置 配置_;
 
     // 专家网络池
-    std::vector<std::shared_ptr<频域状态空间模型>> 专家网络_;
-    
+    std::vector<std::shared_ptr<频域MoE模型>> 专家网络_;
+
     // 门控网络
-    torch::nn::Sequential 门控网络_{nullptr};
-    torch::nn::Dropout 门控Dropout_{nullptr};
-    
+    torch::nn::Sequential 门控网络_{ nullptr };
+    torch::nn::Dropout 门控Dropout_{ nullptr };
+
     // 输出层
-    torch::nn::Linear 输出层_{nullptr};
+    torch::nn::Linear 输出层_{ nullptr };
 
     // 专家专业化引导参数
     std::vector<torch::Tensor> 专家频域偏置_;  // 每个专家的频域偏置
@@ -156,6 +166,9 @@ private:
     mutable std::unordered_map<int64_t, torch::Tensor> 专家输出缓存_;
     mutable int64_t 当前缓存序列长度_ = -1;
     mutable torch::Tensor 当前缓存输入_;
+
+    // 关键修复：添加路由概率缓存
+    torch::Tensor 最后路由概率_; // 缓存最近一次路由概率 [批大小, 专家数量]
 
     /**
      * @brief 初始化专家网络
@@ -203,6 +216,7 @@ private:
     void 清空专家缓存();
 };
 
+
 /**
  * @class 频域MoE训练器
  * @brief MoE分类器的专用训练器，处理负载均衡等特性
@@ -215,9 +229,9 @@ public:
      * @param 优化器 基础优化器
      * @param 设备 训练设备
      */
-    频域MoE训练器(std::shared_ptr<频域MoE分类器> 模型,
-                 std::shared_ptr<torch::optim::Optimizer> 优化器,
-                 torch::Device 设备 = torch::kCPU);
+    频域MoE训练器(std::shared_ptr<频域MoE分类器> 模型,  // 修复：shared_ptr
+        std::shared_ptr<torch::optim::Optimizer> 优化器,  // 修复：shared_ptr
+        torch::Device 设备 = torch::kCPU);
 
     /**
      * @brief 训练步骤
@@ -232,6 +246,8 @@ public:
      */
     std::tuple<torch::Tensor, torch::Tensor> 验证步骤(
         const torch::Tensor& 输入, const torch::Tensor& 标签);
+
+    torch::Tensor 计算总损失(const torch::Tensor& 预测输出, const torch::Tensor& 真实标签);
 
     /**
      * @brief 获取训练统计信息
@@ -256,33 +272,35 @@ public:
 
     训练配置 获取配置() const;
 
+    const torch::Tensor& 获取最后路由概率() const;
+
 private:
     训练配置 配置_;
     std::unordered_map<std::string, float> 验证统计_;
     float 最佳损失_ = std::numeric_limits<float>::max();
     int64_t 无改善轮数_ = 0;
-    
-    // 私有方法
-    float 计算梯度范数();
-    void 更新学习率统计();
-    void 记录专家统计();
-    torch::Tensor 计算专家熵(const torch::Tensor& 使用统计);
-    void 自适应损失权重调整();
-    void 打印训练状态();
-    void 早停检查();
-    std::shared_ptr<频域MoE分类器> 模型_;
-    std::shared_ptr<torch::optim::Optimizer> 优化器_;
+
+    std::shared_ptr<频域MoE分类器> 模型_;  // 修复：shared_ptr
+    std::shared_ptr<torch::optim::Optimizer> 优化器_;  // 修复：shared_ptr
     torch::Device 设备_;
 
     // 训练统计
     std::unordered_map<std::string, float> 训练统计_;
     int64_t 训练步数_ = 0;
+    torch::Tensor 最后路由概率_; // 缓存最近一次路由概率
 
-    /**
-     * @brief 计算总损失（分类损失 + MoE特定损失）
-     */
-    torch::Tensor 计算总损失(const torch::Tensor& 输出, const torch::Tensor& 标签);
+    // 私有方法
+    float 计算梯度范数();
+    void 更新学习率统计();
+    float 获取默认学习率();
+
+    void 记录专家统计();
+    torch::Tensor 计算专家熵(const torch::Tensor& 使用统计);
+    void 自适应损失权重调整();
+    void 打印训练状态();
+    void 早停检查();
 };
+
 
 /**
  * @class 频域MoE分析器
@@ -295,6 +313,10 @@ public:
      * @param 模型 MoE分类器实例
      */
     频域MoE分析器(std::shared_ptr<频域MoE分类器> 模型);
+
+    void 设置配置(const 分析配置& 新配置);
+
+    分析配置 获取配置() const;
 
     /**
      * @brief 分析专家专业化程度
@@ -320,6 +342,7 @@ public:
     void 生成专家使用报告();
 
 private:
+    std::unordered_map<std::string, torch::Tensor> 分析专家专业化(const torch::Tensor& 样本数据);
     // 私有方法
     torch::Tensor 计算专家相似度矩阵(const torch::Tensor& 样本数据);
     torch::Tensor 获取特定专家输出(const torch::Tensor& 输入, int64_t 专家索引);

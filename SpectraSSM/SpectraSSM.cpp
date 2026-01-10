@@ -23,7 +23,7 @@ namespace SpectraSSM {
      * @param 状态维度 状态空间隐藏维度
      * @param 最大序列长度 支持的最大序列长度
      */
-    频域状态空间模型::频域状态空间模型(
+    频域MoE模型::频域MoE模型(
         int64_t 模型维度,
         int64_t 状态维度,
         int64_t 最大序列长度)
@@ -62,7 +62,7 @@ namespace SpectraSSM {
         核已计算_ = false;
         当前缓存序列长度_ = 0;
 
-        TORCH_INFO("频域状态空间模型初始化完成，模型维度: ", 模型维度,
+        TORCH_INFO("频域MoE模型初始化完成，模型维度: ", 模型维度,
             ", 状态维度: ", 状态维度,
             ", 最大序列长度: ", 最大序列长度);
         // 新增：初始化多尺度融合权重 [多尺度数量]
@@ -75,11 +75,11 @@ namespace SpectraSSM {
 
     }
 
-    // 频域状态空间模型前向传播实现
+    // 频域MoE模型前向传播实现
     // 功能：执行频域并行状态空间计算
     // 输入: [批大小, 序列长度, 模型维度]
     // 输出: [批大小, 序列长度, 状态维度]
-    torch::Tensor 频域状态空间模型::前向传播(const torch::Tensor& 输入) const {
+    torch::Tensor 频域MoE模型::前向传播(const torch::Tensor& 输入) const {
         // ------------------------------------------------------------------
         // 第一阶段：输入验证和设备检查
         // ------------------------------------------------------------------
@@ -92,7 +92,7 @@ namespace SpectraSSM {
 
         // 确保模型参数在正确设备上
         if (A_频率.device() != 计算设备) {
-            const_cast<频域状态空间模型*>(this)->to(计算设备);
+            const_cast<频域MoE模型*>(this)->to(计算设备);
             TORCH_INFO("模型参数已迁移到输入设备: ", 计算设备);
         }
 
@@ -248,7 +248,7 @@ namespace SpectraSSM {
 
         // 确保所有尺度都有输出
         TORCH_CHECK(尺度输出列表.size() == 多尺度数量_,
-            "尺度输出数量不匹配，期望 ", 多尺度数量_, " 但得到 ", 尺度endl输出列表.size());
+            "尺度输出数量不匹配，期望 ", 多尺度数量_);
 
         // ------------------------------------------------------------------
         // 第五阶段：多尺度自适应融合
@@ -344,7 +344,7 @@ namespace SpectraSSM {
 
         return 最终结果;
     }
-    torch::Tensor 频域状态空间模型::计算多尺度频率(int64_t 序列长度) const {
+    torch::Tensor 频域MoE模型::计算多尺度频率(int64_t 序列长度) const {
         TORCH_CHECK(序列长度 > 0, "序列长度必须大于0");
 
         int64_t 频率数量 = 序列长度 / 2 + 1;
@@ -372,7 +372,7 @@ namespace SpectraSSM {
 
         return torch::stack(多尺度频率缓存_);
     }
-    torch::Tensor 频域状态空间模型::计算多尺度传递函数核(int64_t 序列长度) const {
+    torch::Tensor 频域MoE模型::计算多尺度传递函数核(int64_t 序列长度) const {
         TORCH_CHECK(序列长度 > 0, "序列长度必须大于0");
 
         // 计算多尺度频率（如果尚未计算）
@@ -426,7 +426,7 @@ namespace SpectraSSM {
         TORCH_INFO("多尺度传递函数核计算完成，总形状: ", 堆叠核.sizes());
         return 堆叠核;
     }
-    torch::Tensor 频域状态空间模型::多尺度频域融合(
+    torch::Tensor 频域MoE模型::多尺度频域融合(
         const std::vector<torch::Tensor>& 尺度输出) const {
 
         TORCH_CHECK(尺度输出.size() == 多尺度数量_, "尺度输出数量不匹配");
@@ -449,7 +449,7 @@ namespace SpectraSSM {
 
             // 简单的线性投影生成动态权重
             auto 投影权重 = torch::ones({ 状态维度_, 多尺度数量_ }, 设备);
-            auto 动态权重 = torch::sigmoid(输出特征 @ 投影权重); // [批大小, 多尺度数量]
+            auto 动态权重 = torch::sigmoid(输出特征,投影权重); // [批大小, 多尺度数量]
 
             // 应用动态权重
             融合输出 = torch::zeros_like(尺度输出[0]);
@@ -474,7 +474,7 @@ namespace SpectraSSM {
      * @param 序列长度 当前输入序列长度
      * @return 频率向量 [n_freq]，其中 n_freq = 序列长度 / 2 + 1
      */
-    torch::Tensor 频域状态空间模型::计算频率(int64_t 序列长度)const{
+    torch::Tensor 频域MoE模型::计算频率(int64_t 序列长度)const{
         TORCH_CHECK(序列长度 > 0, "序列长度必须大于0");
 
         // FFT频率 bins: ω_k = 2πk / n, k = 0, 1, ..., n/2
@@ -499,7 +499,7 @@ namespace SpectraSSM {
      * @param 序列长度 当前输入序列长度
      * @return 传递函数核 [n_freq, 状态维度, 模型维度]
      */
-    torch::Tensor 频域状态空间模型::计算传递函数核(int64_t 序列长度)const{
+    torch::Tensor 频域MoE模型::计算传递函数核(int64_t 序列长度)const{
         TORCH_CHECK(序列长度 > 0, "序列长度必须大于0");
 
         TORCH_INFO("开始计算传递函数核，序列长度: ", 序列长度);
@@ -581,7 +581,7 @@ namespace SpectraSSM {
      * @return 逆矩阵 [批大小, N, N]
      * @note PyTorch的inverse使用LAPACK/Magma库，数值稳定性好
      */
-    torch::Tensor 频域状态空间模型::批量矩阵求逆(const torch::Tensor& 矩阵组)const{
+    torch::Tensor 频域MoE模型::批量矩阵求逆(const torch::Tensor& 矩阵组)const{
         TORCH_CHECK(矩阵组.defined() && 矩阵组.dim() == 3,
             "输入必须是3维张量 [批大小, N, N]");
         TORCH_CHECK(矩阵组.size(1) == 矩阵组.size(2), "矩阵必须是方阵");
@@ -606,7 +606,7 @@ namespace SpectraSSM {
     /**
      * @brief 重置传递函数缓存
      */
-    void 频域状态空间模型::重置缓存() {
+    void 频域MoE模型::重置缓存() {
         核已计算_ = false;
         频率缓存_ = torch::zeros({ 0 }, torch::TensorOptions().device(A_频率.device()));  // 修正API
         传递函数缓存_ = torch::zeros({ 0 }, torch::TensorOptions().device(A_频率.device()));  // 修正API
@@ -618,7 +618,7 @@ namespace SpectraSSM {
     /**
      * @brief 标记核需要重算（参数已更新）
      */
-    void 频域状态空间模型::标记核需要重算() {
+    void 频域MoE模型::标记核需要重算() {
         核已计算_ = false;
         TORCH_INFO("传递函数核标记为需要重新计算");
     }
@@ -627,7 +627,7 @@ namespace SpectraSSM {
      * @brief 获取所有可训练参数
      * @return 参数向量，用于梯度管理器
      */
-    std::vector<torch::Tensor> 频域状态空间模型::获取参数列表() {
+    std::vector<torch::Tensor> 频域MoE模型::获取参数列表() {
         std::vector<torch::Tensor> 参数列表;
 
         // 收集所有注册的可训练参数
@@ -644,7 +644,7 @@ namespace SpectraSSM {
      * @brief 获取命名参数映射
      * @return 参数名称到参数的映射，用于动态分组
      */
-    std::unordered_map<std::string, torch::Tensor*> 频域状态空间模型::获取命名参数映射() {
+    std::unordered_map<std::string, torch::Tensor*> 频域MoE模型::获取命名参数映射() {
         std::unordered_map<std::string, torch::Tensor*> 参数映射;
 
         // 直接使用named_parameters()返回的真实名称
@@ -661,7 +661,7 @@ namespace SpectraSSM {
 
         return 参数映射;
     }
-    std::unordered_map<std::string, const torch::Tensor*> 频域状态空间模型::获取命名参数映射() const {
+    std::unordered_map<std::string, const torch::Tensor*> 频域MoE模型::获取命名参数映射() const {
         std::unordered_map<std::string, const torch::Tensor*> 参数映射;
 
         for (const auto& 参数对 : named_parameters()) {
@@ -677,7 +677,7 @@ namespace SpectraSSM {
      * @brief 获取模型配置信息
      * @return 配置字典（维度、序列长度等）
      */
-    std::unordered_map<std::string, int64_t> 频域状态空间模型::获取配置() const {
+    std::unordered_map<std::string, int64_t> 频域MoE模型::获取配置() const {
         return {
             {"模型维度", 模型维度_},
             {"状态维度", 状态维度_},

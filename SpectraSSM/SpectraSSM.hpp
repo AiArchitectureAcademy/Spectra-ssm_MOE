@@ -1,6 +1,6 @@
 ﻿#pragma once
 // ============================================================
-// SpectraSSM - 频域状态空间模型完整声明
+// SpectraSSM - 频域MoE模型完整声明
 // 文件名: SpectraSSM.hpp
 // 依赖: torch, C++20
 // ============================================================
@@ -76,7 +76,7 @@ namespace SpectraSSM {
 
 
     /**
-     * @class 频域状态空间模型
+     * @class 频域MoE模型
      * @brief 基于傅里叶变换的并行状态空间模型核心实现
      *
      * 核心创新：
@@ -90,14 +90,14 @@ namespace SpectraSSM {
      *   Y(ω) = H(ω) · X(ω)
      *   y(t) = iFFT(Y(ω))
      */
-    class 频域状态空间模型 : public torch::nn::Module {
+    class 频域MoE模型 : public torch::nn::Module {
     public:
         /**
          * @param 模型维度 输入/输出特征维度（d_model）
          * @param 状态维度 状态空间隐藏维度（d_state）
          * @param 最大序列长度 支持的最大序列长度（默认32768）
          */
-        频域状态空间模型(int64_t 模型维度, int64_t 状态维度,
+        频域MoE模型(int64_t 模型维度, int64_t 状态维度,
             int64_t 最大序列长度 = 32768);
 
         /**
@@ -106,7 +106,14 @@ namespace SpectraSSM {
          * @return 输出状态 [批大小, 序列长度, 状态维度]
          */
         torch::Tensor 前向传播(const torch::Tensor& 输入)const;
-
+        // 路由概率访问接口
+        const torch::Tensor& 获取最后路由概率() const {
+            TORCH_CHECK(
+                最后路由概率_.defined() && 最后路由概率_.numel() > 0,
+                "错误: 必须先执行前向传播才能获取路由概率"
+            );
+            return 最后路由概率_;
+        }
         /**
          * @brief 重置传递函数缓存
          * @note 在参数更新后调用，强制重新计算传递函数核
@@ -145,6 +152,7 @@ namespace SpectraSSM {
          */
         torch::Tensor 计算频率(int64_t 序列长度)const;
     private:
+        torch::Tensor 最后路由概率_; // 内部缓存
         // 模型核心维度
         int64_t 模型维度_;
         int64_t 状态维度_;

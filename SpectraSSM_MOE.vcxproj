@@ -70,6 +70,9 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <LibraryPath>C:\VulkanSDK\1.4.321.1\Lib;$(LibraryPath)</LibraryPath>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
@@ -117,20 +120,23 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;ENABLE_SHADERC_RUNTIME_COMPILATION;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>C:\libtorch\include\torch\csrc\api\include;C:\libtorch\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\VulkanSDK\1.4.321.1\Source\SPIRV-Reflect\include;C:\VulkanSDK\1.4.321.1\Include\glslang\Include;C:\VulkanSDK\1.4.321.1\Include;C:\libtorch\include\torch\csrc\api\include;C:\libtorch\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>C:\VulkanSDK\1.4.321.1\Lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>shaderc_combined.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="SpectraSSM\SpectraSSM.cpp" />
     <ClCompile Include="SpectraSSM\SpectraSSM_Generator.cpp" />
     <ClCompile Include="SpectraSSM\SpectraSSM_MoE.cpp" />
+    <ClCompile Include="SpectraSSM\Vulkan优化器.cpp" />
     <ClCompile Include="SpectraSSM\训练器.cpp" />
     <ClCompile Include="SpectraSSM_MOE.cpp" />
   </ItemGroup>
@@ -138,6 +144,7 @@
     <ClInclude Include="SpectraSSM\SpectraSSM.hpp" />
     <ClInclude Include="SpectraSSM\SpectraSSM_Generator.hpp" />
     <ClInclude Include="SpectraSSM\SpectraSSM_MoE.hpp" />
+    <ClInclude Include="SpectraSSM\Vulkan优化器.hpp" />
     <ClInclude Include="SpectraSSM\训练器.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

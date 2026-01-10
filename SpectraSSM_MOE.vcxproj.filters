@@ -33,6 +33,9 @@
     <ClCompile Include="SpectraSSM\SpectraSSM.cpp">
       <Filter>SpectraSSM</Filter>
     </ClCompile>
+    <ClCompile Include="SpectraSSM\Vulkan优化器.cpp">
+      <Filter>SpectraSSM</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="SpectraSSM\SpectraSSM.hpp">
@@ -45,6 +48,9 @@
       <Filter>SpectraSSM</Filter>
     </ClInclude>
     <ClInclude Include="SpectraSSM\训练器.hpp">
+      <Filter>SpectraSSM</Filter>
+    </ClInclude>
+    <ClInclude Include="SpectraSSM\Vulkan优化器.hpp">
       <Filter>SpectraSSM</Filter>
     </ClInclude>
   </ItemGroup>

@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <string>
 #include <vector>
+#include "Vulkan优化器.hpp"
 
 namespace SpectraSSM {
 
@@ -90,10 +91,10 @@ namespace SpectraSSM {
     public:
         /**
          * @brief 构造函数
-         * @param 模型 要训练的频域状态空间模型
+         * @param 模型 要训练的频域MoE模型
          * @param 配置 训练配置参数
          */
-        训练器(std::shared_ptr<频域状态空间模型> 模型, const 训练配置& 配置);
+        训练器(std::shared_ptr<频域MoE模型> 模型, const 训练配置& 配置);
 
         /**
          * @brief 执行单次训练步骤
@@ -152,12 +153,27 @@ namespace SpectraSSM {
          * @return 训练历史记录引用
          */
         const 训练历史& 获取训练历史() const { return 训练历史_; }
+        //@brief 切换到 Vulkan GPU 优化器
 
+        void 使用Vulkan优化器(std::shared_ptr<Vulkan优化器> vulkan优化器) {
+            vulkan优化器_ = vulkan优化器;
+            TORCH_INFO("已切换到 ", 优化器类型转字符串(配置_.优化器类型), " (Vulkan GPU 加速)");
+        }
     private:
         /**
          * @brief 初始化优化器
          */
         void 初始化优化器();
+
+        void 初始化SGD优化器(const std::vector<torch::Tensor>& 参数列表);
+
+        void 初始化Adam优化器(const std::vector<torch::Tensor>& 参数列表);
+
+        void 初始化AdamW优化器(const std::vector<torch::Tensor>& 参数列表);
+
+        void 初始化RMSprop优化器(const std::vector<torch::Tensor>& 参数列表);
+
+        void 初始化Vulkan优化器();
 
         /**
          * @brief 记录训练指标
@@ -181,9 +197,13 @@ namespace SpectraSSM {
         std::string 优化器类型转字符串(优化器类型 类型);
 
     private:
-        std::shared_ptr<频域状态空间模型> 模型_;  ///< 要训练的模型
+        std::shared_ptr<频域MoE模型> 模型_;  ///< 要训练的模型
         训练配置 配置_;                           ///< 训练配置参数
-        std::unique_ptr<torch::optim::Optimizer> 优化器_;  ///< 优化器实例
+        // 传统优化器
+        std::unique_ptr<torch::optim::Optimizer> torch优化器_;
+
+        // Vulkan GPU 优化器
+        std::shared_ptr<Vulkan优化器> vulkan优化器_;
         torch::nn::MSELoss 损失函数_;             ///< 损失函数
 
         训练历史 训练历史_;                        ///< 训练历史记录

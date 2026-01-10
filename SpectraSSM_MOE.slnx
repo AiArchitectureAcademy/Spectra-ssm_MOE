@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="SpectraSSM_MOE.vcxproj" />
+  <Project Path="SpectraSSM_MOE.vcxproj" Id="06e794b9-c917-46b7-a3ab-734a8c91daf3" />
 </Solution>

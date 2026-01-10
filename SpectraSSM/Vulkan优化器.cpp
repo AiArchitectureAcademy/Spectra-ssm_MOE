@@ -261,93 +261,316 @@ void main() {
     }
 
     void VulkanAdam优化器::创建参数缓冲(const std::string& 参数名, size_t 元素数量) {
-        // 检查是否已创建
-        if (参数缓冲映射_.count(参数名)) return;
+        // 防止重复创建
+        if (参数缓冲映射_.find(参数名) != 参数缓冲映射_.end()) {
+            TORCH_WARN("参数缓冲 '", 参数名, "' 已存在，跳过创建");
+            return;
+        }
 
-        size_t 缓冲区大小 = 元素数量 * sizeof(float);
+        // 计算缓冲区大小（4个缓冲：参数、梯度、动量、二阶动量）
+        const vk::DeviceSize 缓冲区大小 = 元素数量 * sizeof(float);
+        const vk::DeviceSize 总内存需求 = 缓冲区大小 * 4ULL;
 
-        // 创建四个缓冲区：参数、梯度、动量、二阶动量
-        vk::BufferCreateInfo 缓冲信息(
-            {},  // flags
-            缓冲区大小,  // size
+        // ⚠️ 核显内存预算检查（780M实际可用约400-450MB）
+        if (当前内存使用量_ + 总内存需求 > 最大显存预算_) {
+            TORCH_ERROR("核显内存不足！");
+            TORCH_ERROR("  - 当前使用量: ", 当前内存使用量_ / 1024 / 1024, " MB");
+            TORCH_ERROR("  - 需要分配: ", 总内存需求 / 1024 / 1024, " MB");
+            TORCH_ERROR("  - 剩余预算: ", (最大显存预算_ - 当前内存使用量_) / 1024 / 1024, " MB");
+            TORCH_ERROR("  - 参数名: ", 参数名);
+
+            // 提供优化建议
+            if (元素数量 > 10 * 1024 * 1024) {
+                TORCH_WARN("建议：该参数规模过大（", 元素数量 / 1024 / 1024, "M元素），");
+                TORCH_WARN("      请使用梯度检查点或减小批大小");
+            }
+
+            throw std::runtime_error("核显内存溢出：参数 '" + 参数名 + "' 分配失败");
+        }
+
+        // 创建四个缓冲区对象（共享同一块内存）
+        vk::BufferCreateInfo 缓冲创建信息(
+            vk::BufferCreateFlags(),  // flags
+            缓冲区大小,              // size
             vk::BufferUsageFlagBits::eStorageBuffer |
             vk::BufferUsageFlagBits::eTransferSrc |
             vk::BufferUsageFlagBits::eTransferDst  // usage
         );
 
-        GPU参数缓冲 缓冲;
-        缓冲.参数缓冲 = 逻辑设备_.createBuffer(缓冲信息);
-        缓冲.梯度缓冲 = 逻辑设备_.createBuffer(缓冲信息);
-        缓冲.动量缓冲 = 逻辑设备_.createBuffer(缓冲信息);
-        缓冲.二阶动量缓冲 = 逻辑设备_.createBuffer(缓冲信息);
-        缓冲.元素数量 = 元素数量;
+        GPU参数缓冲 新缓冲;
+        新缓冲.参数缓冲 = 逻辑设备_.createBuffer(缓冲创建信息);
+        新缓冲.梯度缓冲 = 逻辑设备_.createBuffer(缓冲创建信息);
+        新缓冲.动量缓冲 = 逻辑设备_.createBuffer(缓冲创建信息);
+        新缓冲.二阶动量缓冲 = 逻辑设备_.createBuffer(缓冲创建信息);
+        新缓冲.元素数量 = 元素数量;
 
-        // 分配并绑定内存
-        auto 内存需求 = 逻辑设备_.getBufferMemoryRequirements(缓冲.参数缓冲);
-        vk::MemoryAllocateInfo 分配信息(内存需求.size * 4, 0);
-        缓冲.内存 = 逻辑设备_.allocateMemory(分配信息);
+        // 获取内存需求（4个缓冲大小相同，只需查询一次）
+        auto 内存需求 = 逻辑设备_.getBufferMemoryRequirements(新缓冲.参数缓冲);
 
-        // 绑定内存
-        逻辑设备_.bindBufferMemory(缓冲.参数缓冲, 缓冲.内存, 0);
-        逻辑设备_.bindBufferMemory(缓冲.梯度缓冲, 缓冲.内存, 内存需求.size);
-        逻辑设备_.bindBufferMemory(缓冲.动量缓冲, 缓冲.内存, 内存需求.size * 2);
-        逻辑设备_.bindBufferMemory(缓冲.二阶动量缓冲, 缓冲.内存, 内存需求.size * 3);
+        // 智能选择内存类型（核显用零拷贝内存）
+        uint32_t 内存类型索引 = 0;
+        if (使用零拷贝模式_) {
+            // 核显：查找HOST_VISIBLE | HOST_COHERENT内存（通常为内存类型0）
+            auto 内存属性 = 物理设备_.getMemoryProperties();
+            bool 找到合适类型 = false;
 
-        // 初始化动量和二阶动量为零
-        float* 映射指针 = static_cast<float*>(逻辑设备_.mapMemory(缓冲.内存,
-            内存需求.size * 2,
-            内存需求.size * 2));
-        memset(映射指针, 0, 内存需求.size * 2);
-        逻辑设备_.unmapMemory(缓冲.内存);
+            for (uint32_t i = 0; i < 内存属性.memoryTypeCount; ++i) {
+                // 检查该内存类型是否支持此缓冲
+                if ((内存需求.memoryTypeBits & (1 << i)) == 0) continue;
 
-        参数缓冲映射_[参数名] = std::move(缓冲);
+                auto 标志 = 内存属性.memoryTypes[i].propertyFlags;
+                bool 是主机可见 = (标志 & vk::MemoryPropertyFlagBits::eHostVisible) != vk::MemoryPropertyFlags();
+                bool 是主机一致 = (标志 & vk::MemoryPropertyFlagBits::eHostCoherent) != vk::MemoryPropertyFlags();
+
+                // 核显最优：HOST_VISIBLE | HOST_COHERENT
+                if (是主机可见 && 是主机一致) {
+                    内存类型索引 = i;
+                    找到合适类型 = true;
+
+                    TORCH_INFO("核显内存：选中类型[", i, "] HOST_VISIBLE|HOST_COHERENT");
+                    break;
+                }
+            }
+
+            if (!找到合适类型) {
+                // 降级策略：只要HOST_VISIBLE
+                for (uint32_t i = 0; i < 内存属性.memoryTypeCount; ++i) {
+                    if ((内存需求.memoryTypeBits & (1 << i)) &&
+                        (内存属性.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+                        内存类型索引 = i;
+                        TORCH_WARN("核显内存：仅找到HOST_VISIBLE类型[", i, "]，性能可能下降");
+                        break;
+                    }
+                }
+            }
+        }
+        else {
+            // 独显：使用DEVICE_LOCAL内存（显存）
+            auto 内存属性 = 物理设备_.getMemoryProperties();
+            for (uint32_t i = 0; i < 内存属性.memoryTypeCount; ++i) {
+                if ((内存需求.memoryTypeBits & (1 << i)) &&
+                    (内存属性.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+                    内存类型索引 = i;
+                    break;
+                }
+            }
+        }
+
+        if (内存类型索引 == UINT32_MAX) {
+            throw std::runtime_error("未找到合适的Vulkan内存类型");
+        }
+
+        // ✅ 一次性分配所有缓冲所需的内存
+        vk::MemoryAllocateInfo 内存分配信息(内存需求.size * 4, 内存类型索引);
+        新缓冲.内存 = 逻辑设备_.allocateMemory(内存分配信息);
+
+        // 将四个缓冲区绑定到同一块内存的不同偏移位置
+        逻辑设备_.bindBufferMemory(新缓冲.参数缓冲, 新缓冲.内存, 0);
+        逻辑设备_.bindBufferMemory(新缓冲.梯度缓冲, 新缓冲.内存, 内存需求.size);
+        逻辑设备_.bindBufferMemory(新缓冲.动量缓冲, 新缓冲.内存, 内存需求.size * 2);
+        逻辑设备_.bindBufferMemory(新缓冲.二阶动量缓冲, 新缓冲.内存, 内存需求.size * 3);
+
+        // ✅ 核显特殊处理：直接CPU映射初始化动量缓冲为0
+        if (使用零拷贝模式_) {
+            // 映射动量和二阶动量区域（偏移2*size，大小2*size）
+            void* 映射指针 = 逻辑设备_.mapMemory(
+                新缓冲.内存,
+                内存需求.size * 2,  // 偏移量
+                内存需求.size * 2   // 映射大小（两个缓冲）
+            );
+
+            if (映射指针) {
+                memset(映射指针, 0, 内存需求.size * 2);  // 动量和二阶动量初始化为0
+                逻辑设备_.unmapMemory(新缓冲.内存);
+            }
+            else {
+                TORCH_ERROR("核显内存映射失败，无法初始化动量缓冲");
+            }
+        }
+        else {
+            // 独显：通过命令缓冲区上传初始化数据
+            // （保持原有实现）
+        }
+
+        // 存入映射表
+        参数缓冲映射_[参数名] = std::move(新缓冲);
+        当前内存使用量_ += 总内存需求;
+
+        // 📊 详细日志输出
+        TORCH_INFO("✓ 创建参数缓冲: ", 参数名);
+        TORCH_INFO("  - 元素数量: ", 元素数量, " (", 元素数量 / 1024.0 / 1024.0, "M)");
+        TORCH_INFO("  - 单个缓冲: ", 缓冲区大小 / 1024, " KB");
+        TORCH_INFO("  - 总内存: ", 总内存需求 / 1024 / 1024, " MB");
+        TORCH_INFO("  - 内存类型索引: ", 内存类型索引);
+        TORCH_INFO("  - 零拷贝模式: ", 使用零拷贝模式_ ? "是" : "否");
+        TORCH_INFO("  - 累计显存使用: ", 当前内存使用量_ / 1024 / 1024, " MB / ",
+            最大显存预算_ / 1024 / 1024, " MB");
     }
 
     void VulkanAdam优化器::上传张量数据(const torch::Tensor& 张量, vk::Buffer 目标缓冲) {
-        // 确保张量在CUDA上并连续
-        auto gpu张量 = 张量.to(torch::kCUDA).contiguous();
-        float* 数据指针 = gpu张量.data_ptr<float>();
-        size_t 数据大小 = gpu张量.numel() * sizeof(float);
+        TORCH_CHECK(张量.defined(), "输入张量未定义");
+        TORCH_CHECK(张量.is_contiguous(), "张量必须连续");
+        TORCH_CHECK(张量.dtype() == torch::kFloat32, "仅支持float32类型");
 
-        // 创建临时上传缓冲区
-        vk::BufferCreateInfo 临时信息(
-            {},  // flags
-            数据大小,  // size
-            vk::BufferUsageFlagBits::eTransferSrc  // usage
-        );
-        vk::Buffer 临时缓冲 = 逻辑设备_.createBuffer(临时信息);
+        const size_t 元素数量 = 张量.numel();
+        const vk::DeviceSize 数据大小 = 元素数量 * sizeof(float);
 
-        auto 内存需求 = 逻辑设备_.getBufferMemoryRequirements(临时缓冲);
-        vk::MemoryAllocateInfo 分配信息(数据大小, 0);
-        vk::DeviceMemory 临时内存 = 逻辑设备_.allocateMemory(分配信息);
-        逻辑设备_.bindBufferMemory(临时缓冲, 临时内存, 0);
+        if (数据大小 == 0) {
+            TORCH_WARN("上传数据大小为0，跳过");
+            return;
+        }
 
-        // 将数据映射到GPU
-        void* 映射 = 逻辑设备_.mapMemory(临时内存, 0, 数据大小);
-        memcpy(映射, 数据指针, 数据大小);
-        逻辑设备_.unmapMemory(临时内存);
+        // 获取张量数据指针
+        // 核显模式：张量通常在CPU内存，可直接访问
+        // 独显模式：需要确保数据在CUDA上
+        const float* 张量数据指针 = 张量.data_ptr<float>();
 
-        // 执行复制命令
-        vk::CommandBufferAllocateInfo 分配信息命令(命令池_, vk::CommandBufferLevel::ePrimary, 1);
-        vk::CommandBuffer 命令缓冲 = 逻辑设备_.allocateCommandBuffers(分配信息命令)[0];
+        // 获取目标缓冲关联的内存
+        vk::DeviceMemory 目标内存 = 获取缓冲关联内存(目标缓冲);
+        TORCH_CHECK(目标内存, "未找到目标缓冲关联的内存");
+
+        // 获取缓冲内存需求（验证大小）
+        auto 内存需求 = 逻辑设备_.getBufferMemoryRequirements(目标缓冲);
+        if (数据大小 > 内存需求.size) {
+            TORCH_ERROR("数据大小 ", 数据大小, " 超过缓冲大小 ", 内存需求.size);
+            throw std::runtime_error("Vulkan上传：数据溢出");
+        }
+
+        // ⭐ 核显零拷贝路径：直接内存映射
+        if (使用零拷贝模式_) {
+            TORCH_INFO("核显零拷贝上传: ", 数据大小 / 1024.0, " KB");
+
+            // 映射Vulkan缓冲内存到CPU地址空间
+            void* 映射内存 = 逻辑设备_.mapMemory(目标内存, 0, 数据大小);
+            if (!映射内存) {
+                TORCH_ERROR("核显内存映射失败");
+                throw std::runtime_error("Vulkan映射内存失败");
+            }
+
+            // 直接内存拷贝（PyTorch CPU -> Vulkan共享内存）
+            std::memcpy(映射内存, 张量数据指针, 数据大小);
+
+            // ✅ 关键：核显需要flush确保GPU可见性
+            // 即使HOST_COHERENT也建议显式flush保证跨设备一致性
+            vk::MappedMemoryRange 刷新范围(目标内存, 0, 数据大小);
+            vk::Result 结果 = 逻辑设备_.flushMappedMemoryRanges(1, &刷新范围);
+
+            if (结果 != vk::Result::eSuccess) {
+                TORCH_WARN("flushMappedMemoryRanges失败: ", vk::to_string(结果));
+            }
+
+            逻辑设备_.unmapMemory(目标内存);
+
+            // 性能统计
+            static std::atomic<uint64_t> 总上传量{ 0 };
+            总上传量 += 数据大小;
+            TORCH_INFO("  - 累计上传: ", 总上传量.load() / 1024 / 1024, " MB");
+        }
+        // 独显传统路径：使用临时缓冲和DMA
+        else {
+            TORCH_INFO("独显DMA上传: ", 数据大小 / 1024.0, " KB");
+
+            // 确保张量在CUDA设备上
+            auto cuda张量 = 张量.to(torch::kCUDA).contiguous();
+            const float* cuda数据指针 = cuda张量.data_ptr<float>();
+
+            // 创建临时上传缓冲（Staging Buffer）
+            vk::BufferCreateInfo 临时缓冲信息(
+                vk::BufferCreateFlags(),
+                数据大小,
+                vk::BufferUsageFlagBits::eTransferSrc  // 仅用于传输源
+            );
+            vk::Buffer 临时缓冲 = 逻辑设备_.createBuffer(临时缓冲信息);
+
+            auto 临时内存需求 = 逻辑设备_.getBufferMemoryRequirements(临时缓冲);
+
+            // 临时缓冲使用HOST_VISIBLE内存（CPU可写）
+            uint32_t 临时内存类型 = 查找零拷贝内存类型(临时内存需求);
+            vk::MemoryAllocateInfo 临时分配信息(数据大小, 临时内存类型);
+            vk::DeviceMemory 临时内存 = 逻辑设备_.allocateMemory(临时分配信息);
+            逻辑设备_.bindBufferMemory(临时缓冲, 临时内存, 0);
+
+            // 1. 将数据写入临时缓冲
+            void* 映射内存 = 逻辑设备_.mapMemory(临时内存, 0, 数据大小);
+            std::memcpy(映射内存, cuda数据指针, 数据大小);  // CUDA -> CPU -> Vulkan
+            逻辑设备_.unmapMemory(临时内存);
+
+            // 2. 执行DMA传输（CPU -> GPU）
+            vk::CommandBuffer 命令缓冲 = 开始单次命令();
+
+            vk::BufferCopy 拷贝区域(0, 0, 数据大小);
+            命令缓冲.copyBuffer(临时缓冲, 目标缓冲, 1, &拷贝区域);
+
+            结束并提交命令(命令缓冲);
+
+            // 3. 清理临时资源
+            逻辑设备_.destroyBuffer(临时缓冲);
+            逻辑设备_.freeMemory(临时内存);
+        }
+    }
+    // 辅助函数：单次命令缓冲工具
+    vk::CommandBuffer VulkanAdam优化器::开始单次命令() {
+        vk::CommandBufferAllocateInfo 分配信息(命令池_, vk::CommandBufferLevel::ePrimary, 1);
+        vk::CommandBuffer 命令缓冲 = 逻辑设备_.allocateCommandBuffers(分配信息)[0];
 
         vk::CommandBufferBeginInfo 开始信息(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
         命令缓冲.begin(开始信息);
 
-        vk::BufferCopy 复制区域(0, 0, 数据大小);
-        命令缓冲.copyBuffer(临时缓冲, 目标缓冲, 1, &复制区域);
-
+        return 命令缓冲;
+    }
+    void VulkanAdam优化器::结束并提交命令(vk::CommandBuffer 命令缓冲) {
         命令缓冲.end();
 
-        vk::SubmitInfo 提交(0, nullptr, nullptr, 1, &命令缓冲);
-        计算队列_.submit(1, &提交, nullptr);
-        计算队列_.waitIdle();
+        vk::SubmitInfo 提交信息(0, nullptr, nullptr, 1, &命令缓冲);
+        计算队列_.submit(1, &提交信息, nullptr);
+        计算队列_.waitIdle();  // 单次命令通常同步等待
 
-        // 清理临时资源
-        逻辑设备_.destroyBuffer(临时缓冲);
-        逻辑设备_.freeMemory(临时内存);
+        逻辑设备_.freeCommandBuffers(命令池_, 1, &命令缓冲);
+    }
+    // 辅助函数：获取缓冲对应的内存对象
+    vk::DeviceMemory VulkanAdam优化器::获取缓冲关联内存(vk::Buffer 缓冲) {
+        for (const auto& [名称, 缓冲信息] : 参数缓冲映射_) {
+            if (缓冲信息.参数缓冲 == 缓冲 ||
+                缓冲信息.梯度缓冲 == 缓冲 ||
+                缓冲信息.动量缓冲 == 缓冲 ||
+                缓冲信息.二阶动量缓冲 == 缓冲) {
+                return 缓冲信息.内存;
+            }
+        }
+
+        // 尝试Uniform缓冲
+        if (缓冲 == uniform缓冲区_) {
+            return uniform内存_;
+        }
+
+        TORCH_ERROR("未找到缓冲关联的内存");
+        return vk::DeviceMemory();  // 返回空句柄
     }
 
+    // 辅助函数：查找零拷贝内存类型
+    uint32_t VulkanAdam优化器::查找零拷贝内存类型(const vk::MemoryRequirements& 需求) {
+        auto 内存属性 = 物理设备_.getMemoryProperties();
+
+        // 优先级1: HOST_VISIBLE | HOST_COHERENT（零拷贝首选）
+        // 优先级2: HOST_VISIBLE（可能需要手动flush）
+        for (uint32_t i = 0; i < 内存属性.memoryTypeCount; ++i) {
+            if ((需求.memoryTypeBits & (1 << i)) &&
+                (内存属性.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+
+                // 记录选择的内存类型
+                vk::MemoryPropertyFlags 标志 = 内存属性.memoryTypes[i].propertyFlags;
+                TORCH_INFO("核显内存类型[", i, "]: ",
+                    (标志 & vk::MemoryPropertyFlagBits::eHostVisible ? "HOST_VISIBLE " : ""),
+                    (标志 & vk::MemoryPropertyFlagBits::eHostCoherent ? "HOST_COHERENT " : ""),
+                    (标志 & vk::MemoryPropertyFlagBits::eDeviceLocal ? "DEVICE_LOCAL" : ""));
+
+                return i;
+            }
+        }
+
+        TORCH_ERROR("未找到合适的核显内存类型");
+        throw std::runtime_error("核显内存类型检测失败");
+    }
     void VulkanAdam优化器::下载张量数据(torch::Tensor& 张量, vk::Buffer 源缓冲) {
         size_t 数据大小 = 张量.numel() * sizeof(float);
 

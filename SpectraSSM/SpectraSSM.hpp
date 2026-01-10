@@ -11,44 +11,54 @@
 #include <string>
 #include <functional>
 #include <memory>
-#include < iostream >
-// TORCH_INFO 宏定义
-#define TORCH_INFO(...) \
-    do { \
-        auto now = std::chrono::system_clock::now(); \
-        auto time_t = std::chrono::system_clock::to_time_t(now); \
-        std::tm tm = *std::localtime(&time_t); \
-        std::ostringstream oss; \
-        oss << "[INFO][" << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "] "; \
-        ((oss << __VA_ARGS__)); \
-        oss << '\n'; \
-        std::cout << oss.str(); \
-    } while(0)
-    // 添加 TORCH_ERROR 宏定义
-#define TORCH_ERROR(...) \
-    do { \
-        auto now = std::chrono::system_clock::now(); \
-        auto time_t = std::chrono::system_clock::to_time_t(now); \
-        std::tm tm = *std::localtime(&time_t); \
-        std::ostringstream oss; \
-        oss << "[ERROR][" << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "] "; \
-        ((oss << __VA_ARGS__)); \
-        oss << '\n'; \
-        std::cerr << oss.str(); \
-    } while(0)
+#include <iostream>
+#include <iomanip>
+// 递归展开：处理单个参数
+template<typename T>
+void 日志输出(std::ostringstream& oss, T&& 值) {
+    oss << std::forward<T>(值);
+}
 
-// 添加 TORCH_WARN 宏定义  
-#define TORCH_WARN(...) \
-    do { \
-        auto now = std::chrono::system_clock::now(); \
-        auto time_t = std::chrono::system_clock::to_time_t(now); \
-        std::tm tm = *std::localtime(&time_t); \
-        std::ostringstream oss; \
-        oss << "[WARN][" << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "] "; \
-        ((oss << __VA_ARGS__)); \
-        oss << '\n'; \
-        std::cout << oss.str(); \
-    } while(0)
+// 递归展开：处理多个参数（折叠表达式方式，C++17及以上）
+template<typename T, typename... Args>
+void 日志输出(std::ostringstream& oss, T&& 值, Args&&... 参数) {
+    oss << std::forward<T>(值);
+    日志输出(oss, std::forward<Args>(参数)...);
+}
+
+// 包装函数：添加时间戳
+template<typename... Args>
+void TORCH_INFO(Args&&... 参数) {
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm = *std::localtime(&time_t);
+    std::ostringstream oss;
+    oss << "[INFO][" << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "] ";
+    日志输出(oss, std::forward<Args>(参数)...);
+}
+
+template<typename... Args>
+void TORCH_ERROR(Args&&... 参数) {
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm = *std::localtime(&time_t);
+    std::ostringstream oss;
+    oss << "[ERROR][" << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "] ";
+    日志输出(oss, std::forward<Args>(参数)...);
+}
+
+template<typename... Args>
+void TORCH_WARN(Args&&... 参数) {
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm = *std::localtime(&time_t);
+    std::ostringstream oss;
+    oss << "[WARN][" << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "] ";
+    日志输出(oss, std::forward<Args>(参数)...);
+}
+
+
+
     // 获取张量的设备，如果张量未定义则返回CPU
 inline torch::Device 获取安全设备(const torch::Tensor & 张量) {
     if (张量.defined()) {

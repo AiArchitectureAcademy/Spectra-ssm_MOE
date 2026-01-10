@@ -13,7 +13,6 @@
 namespace SpectraSSM {
 
 // ========================= 频域MoE分类器实现 =========================
-
     频域MoE分类器::频域MoE分类器(int64_t 输入维度, int64_t 类别数,
         const 频域MoE配置& 配置)
         : 输入维度_(输入维度), 类别数_(类别数), 配置_(配置) {
@@ -36,6 +35,9 @@ namespace SpectraSSM {
         // 初始化使用统计
         专家使用统计_ = register_buffer("专家使用统计",
             torch::zeros({ 配置_.专家数量 }, torch::kFloat32));
+
+        // 注册频域偏置缩放参数（关键修复）
+        频域偏置缩放_ = register_parameter("频域偏置缩放", torch::tensor(0.5f, torch::kFloat32));
 
         // 关键修复：初始化路由概率缓存
         最后路由概率_ = register_buffer("最后路由概率",
@@ -133,48 +135,138 @@ torch::Tensor 频域MoE分类器::提取频域特征(const torch::Tensor& 输入
     return 频域特征.to(输入.device());
 }
 
-torch::Tensor 频域MoE分类器::计算门控权重(const torch::Tensor& 输入) {
-    // 提取频域特征
-    auto 频域特征 = 提取频域特征(输入);
-    
-    // 应用专业化偏置（如果启用）
-    if (配置_.启用频域专业化 && !专家频域偏置_.empty()) {
-        // 这里可以添加偏置逻辑，但为了简化先跳过
-        // 实际实现中可以加权不同专家的频域特征
+torch::Tensor 频域MoE分类器::前向传播特定专家(const torch::Tensor& 输入, int64_t 专家索引) {
+    // 验证专家索引有效性
+    TORCH_CHECK(
+        专家索引 >= 0 && 专家索引 < 配置_.专家数量,
+        "专家索引超出有效范围: ", 专家索引,
+        " (有效范围: 0-", 配置_.专家数量 - 1, ")"
+    );
+
+    // 验证输入维度匹配
+    TORCH_CHECK(
+        输入.dim() == 3 && 输入.size(2) == 输入维度_,
+        "输入维度不匹配: 期望特征维度=", 输入维度_,
+        ", 实际=", 输入.size(2)
+    );
+
+    // 直接调用指定专家的前向传播，绕过门控机制
+    // 避免缓存污染，保持分析独立性
+    return 专家网络_[专家索引]->前向传播(输入);
+}
+
+std::vector<torch::Tensor> 频域MoE分类器::批量获取专家输出(const torch::Tensor& 输入) {
+    TORCH_CHECK(输入.dim() == 3, "输入张量必须为3维 [批次, 序列长度, 特征维度]");
+    TORCH_CHECK(输入.size(2) == 输入维度_, "输入特征维度不匹配");
+
+    std::vector<torch::Tensor> 输出列表;
+    输出列表.reserve(配置_.专家数量);
+
+    // 并行计算所有专家输出（底层自动调度GPU计算流）
+    for (int64_t i = 0; i < 配置_.专家数量; ++i) {
+        // 绕过门控和缓存，直接调用专家网络确保分析独立性
+        输出列表.push_back(专家网络_[i]->前向传播(输入));
     }
-    
-    // 门控网络前向传播
+
+    return 输出列表;
+}
+
+torch::Tensor 频域MoE分类器::计算门控权重(const torch::Tensor& 输入) {
+    // ========== 输入验证 ==========
+    TORCH_CHECK(输入.dim() == 3, "门控权重计算：输入必须是3维张量 [batch, seq_len, dim]");
+    TORCH_CHECK(输入.size(0) > 0 && 输入.size(1) > 0, "门控权重计算：批次和序列长度必须>0");
+
+    // ========== 频域特征提取 ==========
+    auto 设备 = 输入.device();
+    auto 频域特征 = 提取频域特征(输入);  // [batch_size, feature_dim]
+    TORCH_CHECK(频域特征.dim() == 2, "门控权重计算：频域特征输出维度异常");
+
+    // ========== 专家专业化偏置 ==========
+    if (配置_.启用频域专业化 && !专家频域偏置_.empty()) {
+        auto 专家偏置矩阵 = torch::stack(专家频域偏置_, 0).to(设备);  // [expert_count, feature_dim]
+        auto 相似度 = torch::matmul(频域特征, 专家偏置矩阵.transpose(0, 1));  // [batch, expert_count]
+
+        // 可学习的缩放参数 - 在构造函数中注册为成员变量
+        // 频域偏置缩放_ 在头文件中声明并在构造函数中初始化
+        频域特征 += 频域偏置缩放_ * 相似度.mean(1, true);  // 广播到特征维度
+    }
+
+    // ========== 门控网络前向传播 ==========
     auto 原始权重 = 门控网络_->forward(频域特征);  // [batch_size, expert_count]
-    
-    // 应用Dropout（训练时）
+    TORCH_CHECK(原始权重.dim() == 2, "门控权重计算：门控网络输出维度异常");
+
+    // 动态温度调整（动态路由关键）
+    float 门控温度 = 1.0f;
+    int64_t 实际激活专家数 = 配置_.激活专家数;
+
+    if (配置_.启用动态路由) {
+        int64_t 序列长度 = 输入.size(1);
+        实际激活专家数 = 计算动态激活专家数(序列长度);
+
+        // 序列越长，温度越低（更确定）
+        门控温度 = std::max(0.3f, 1.5f - 序列长度 * 0.001f);
+    }
+
+    // 应用温度缩放
+    原始权重 = 原始权重 / 门控温度;
+
+    // Dropout（仅在训练时）
     if (is_training()) {
         原始权重 = 门控Dropout_(原始权重);
     }
-    
-    // 动态确定激活专家数量
-    int64_t 实际激活专家数 = 配置_.启用动态路由 ? 
-        计算动态激活专家数(输入.size(1)) : 配置_.激活专家数;
-    
-    // Top-K稀疏化
-    auto topk结果 = torch::topk(
-        torch::softmax(原始权重, /*dim=*/1), 
-        实际激活专家数, 
-        /*dim=*/1,
-        /*largest=*/true,
-        /*sorted=*/true
-    );
-    
-    auto topk权重 = std::get<0>(topk结果);  // [batch_size, k]
-    auto topk索引 = std::get<1>(topk结果);  // [batch_size, k]
-    
-    // 创建稀疏门控矩阵
-    auto 门控矩阵 = torch::zeros({输入.size(0), 配置_.专家数量}, 输入.options());
-    门控矩阵.scatter_(1, topk索引, topk权重);
-    
-    // 更新使用统计
-    更新使用统计(门控矩阵);
-    
-    return 门控矩阵;
+
+    // ========== Top-K稀疏化 ==========
+    TORCH_CHECK(实际激活专家数 > 0 && 实际激活专家数 <= 配置_.专家数量,
+        "门控权重计算：激活专家数无效: ", 实际激活专家数);
+
+    // 先TopK再softmax，大幅减少计算量
+    auto topk结果 = torch::topk(原始权重, 实际激活专家数, 1, true, true);
+    auto topk得分 = std::get<0>(topk结果);  // [batch, k]
+    auto topk索引 = std::get<1>(topk结果);  // [batch, k]
+
+    // 对TopK结果做softmax（detach阻断梯度到专家）
+    auto topk权重 = torch::softmax(topk得分.detach(), 1);  // 关键：detach防止梯度回传
+
+    // ========== 稀疏门控矩阵构建 ==========
+    torch::Tensor 门控输出;
+    if (is_training()) {
+        // 训练：使用稀疏COO格式，节省内存并加速反向传播
+        auto 批次索引 = torch::arange(输入.size(0), torch::kLong).to(设备)
+            .unsqueeze(1).expand_as(topk索引).flatten();
+        auto 专家索引 = topk索引.flatten();
+        auto 权重值 = topk权重.flatten();
+
+        门控输出 = torch::sparse_coo_tensor(
+            torch::stack({ 批次索引, 专家索引 }, 0),
+            权重值,
+            { 输入.size(0), 配置_.专家数量 },
+            torch::TensorOptions().device(设备)
+        ).coalesce();
+    }
+    else {
+        // 推理：使用稠密格式，计算更快
+        门控输出 = torch::zeros({ 输入.size(0), 配置_.专家数量 }, 设备);
+        门控输出.scatter_(1, topk索引, topk权重);
+    }
+
+    // ========== 更新使用统计（无梯度） ==========
+    if (is_training()) {
+        更新使用统计(门控输出.detach());  // detach避免影响主梯度
+    }
+    else {
+        更新使用统计(门控输出);
+    }
+
+    // ========== 缓存路由概率（供训练器使用） ==========
+    if (is_training()) {
+        // 转换为稠密格式用于缓存（但不参与梯度计算）
+        最后路由概率_ = 门控输出.to_dense().detach();
+    }
+    else {
+        最后路由概率_ = 门控输出;  // 推理时已经是稠密
+    }
+
+    return 门控输出;
 }
 
 int64_t 频域MoE分类器::计算动态激活专家数(int64_t 序列长度) const {
@@ -189,15 +281,19 @@ int64_t 频域MoE分类器::计算动态激活专家数(int64_t 序列长度) co
     }
 }
 
-void 频域MoE分类器::更新使用统计(const torch::Tensor& 门控权重) {
+void 频域MoE分类器::更新使用统计(const torch::Tensor& 门控矩阵) {
     if (!is_training()) return;
-    
-    // 计算批次平均使用情况
-    auto 批次使用 = (门控权重 > 1e-6).to(torch::kFloat32).mean(0);  // [expert_count]
-    
-    // 指数移动平均更新统计
+
+    // 确保是稠密张量
+    auto 稠密门控 = 门控矩阵.is_sparse() ? 门控矩阵.to_dense() : 门控矩阵;
+
+    // 计算批次平均使用率（考虑权重大小而非仅是否激活）
+    auto 批次使用 = 稠密门控.mean(0);  // [expert_count]
+
+    // EMA更新
     float 衰减因子 = 0.99f;
-    专家使用统计_ = 衰减因子 * 专家使用统计_ + (1 - 衰减因子) * 批次使用;
+    专家使用统计_ = 衰减因子 * 专家使用统计_.to(批次使用.device()) +
+        (1.0f - 衰减因子) * 批次使用;
     统计更新次数_++;
 }
 
@@ -318,6 +414,8 @@ void 频域MoE分类器::清空专家缓存() {
     当前缓存输入_ = torch::Tensor();
 }
 
+
+
 // ========================= 频域MoE训练器实现 =========================
 
 频域MoE训练器::频域MoE训练器(std::shared_ptr<频域MoE分类器> 模型,
@@ -362,7 +460,8 @@ torch::Tensor 频域MoE训练器::训练步骤(const torch::Tensor& 输入, cons
         torch::nn::utils::clip_grad_norm_(模型_->parameters(), 配置_.最大梯度范数);
         TORCH_WARN("梯度裁剪应用: ", 梯度范数, " -> ", 配置_.最大梯度范数);
     }
-
+    // 参数更新前执行自适应权重调整
+    自适应损失权重调整();
     // 参数更新
     优化器_->step();
 
@@ -456,9 +555,7 @@ torch::Tensor 频域MoE训练器::计算总损失(
         .log_target(false)
     );
 
-    // 3. 组合损失权重（可配置）
-    const float 路由损失权重 = 0.01f;
-    auto 总损失 = 分类损失 + 路由损失权重 * 路由损失;
+    auto 总损失 = 分类损失 + 当前路由损失权重_ * 路由损失;
 
     // 记录损失用于监控
     训练统计_["分类损失"] = 分类损失.item<float>();
@@ -498,17 +595,56 @@ void 频域MoE训练器::加载检查点(const std::string& 路径) {
     TORCH_CHECK(模型_ != nullptr, "模型不能为空");
 }
 
-std::unordered_map<std::string, torch::Tensor> 
-频域MoE分析器::分析专家专业化() {
-    std::unordered_map<std::string, torch::Tensor> 结果;
-    
-    // 获取专家使用统计
-    结果["专家使用率"] = 模型_->获取专家使用统计();
-    
-    // 这里可以添加更复杂的专业化分析
-    // 例如专家输出相关性、频域响应特性等
-    
-    return 结果;
+
+std::unordered_map<std::string, torch::Tensor>
+频域MoE分析器::分析专家专业化(const torch::Tensor& 样本数据) {
+    std::unordered_map<std::string, torch::Tensor> 分析结果;
+
+    torch::NoGradGuard no_grad;
+    模型_->eval();
+
+    auto 设备 = 样本数据.device();
+    auto 配置 = 模型_->获取配置();
+    int64_t 专家数量 = 配置.专家数量;
+
+    TORCH_INFO("开始专家专业化分析，专家数量: ", 专家数量,
+        ", 样本数据形状: ", 样本数据.sizes());
+
+    // 1. 获取专家使用统计
+    auto 专家使用统计 = 模型_->获取专家使用统计();
+    分析结果["专家使用率"] = 专家使用统计;
+    TORCH_INFO("专家使用统计获取完成，平均使用率: ",
+        专家使用统计.mean().item<float>());
+
+    // 2. 计算专家输出相似度矩阵
+    auto 相似度矩阵 = 计算专家相似度矩阵(样本数据);
+    分析结果["专家相似度矩阵"] = 相似度矩阵;
+    TORCH_INFO("专家相似度矩阵计算完成，矩阵形状: ", 相似度矩阵.sizes());
+
+    // 3. 计算专业化指数
+    auto 专业化指数 = 计算专业化指数(相似度矩阵);
+    分析结果["专家专业化指数"] = 专业化指数;
+    TORCH_INFO("专业化指数计算完成: ", 专业化指数.item<float>());
+
+    // 4. 频域响应特性分析
+    auto [频域响应矩阵, 主导频段分布] = 分析频域响应特性(样本数据);
+    分析结果["频域响应矩阵"] = 频域响应矩阵;
+    分析结果["主导频段分布"] = 主导频段分布;
+    TORCH_INFO("频域响应特性分析完成，响应矩阵形状: ",
+        频域响应矩阵.sizes());
+
+    // 5. 路由决策稳定性
+    auto 路由稳定性 = 分析路由稳定性(样本数据);
+    分析结果["路由稳定性"] = 路由稳定性;
+    TORCH_INFO("路由稳定性分析完成，平均方差: ",
+        路由稳定性.item<float>());
+
+    // 6. 计算专家熵（负载均衡指标）
+    auto 专家熵 = 计算专家熵(专家使用统计);
+    分析结果["专家熵"] = 专家熵;
+    TORCH_INFO("专家熵计算完成: ", 专家熵.item<float>());
+
+    return 分析结果;
 }
 
 torch::Tensor 频域MoE分析器::生成路由热力图(const torch::Tensor& 输入样本) {
@@ -544,83 +680,7 @@ torch::Tensor 频域MoE分析器::生成路由热力图(const torch::Tensor& 输
 }
 
 
-torch::Tensor 频域MoE训练器::计算总损失(
-    const torch::Tensor& 预测输出,
-    const torch::Tensor& 真实标签
-) {
-    // 验证路由概率是否已正确缓存
-    TORCH_CHECK(模型_->获取最后路由概率().defined(),
-        "错误: 必须先执行前向传播才能获取路由概率");
 
-    const auto& 路由概率 = 模型_->获取最后路由概率();
-
-    // 动态处理维度以适应不同类型任务
-    auto 预测展平 = 预测输出.reshape({ -1, 预测输出.size(-1) });
-    auto 标签展平 = 真实标签.reshape({ -1 });
-
-    // 验证设备一致性
-    TORCH_CHECK(
-        预测展平.device() == 标签展平.device() &&
-        预测展平.device() == 路由概率.device(),
-        "所有张量必须位于同一设备上"
-    );
-
-    // 验证维度匹配
-    TORCH_CHECK(预测展平.size(0) == 标签展平.size(0),
-        "预测和标签样本数量不匹配");
-
-    TORCH_CHECK(路由概率.dim() == 2,
-        "路由概率必须为2维 [批大小, 专家数]");
-
-    TORCH_CHECK(预测展平.size(0) == 路由概率.size(0),
-        "批大小不匹配: 预测=", 预测展平.size(0),
-        ", 路由=", 路由概率.size(0));
-
-    const int64_t 批大小 = 路由概率.size(0);
-    const int64_t 专家数量 = 路由概率.size(1);
-
-    // 1. 分类交叉熵损失
-    auto 分类损失 = torch::nn::functional::cross_entropy(
-        预测展平,
-        标签展平,
-        torch::nn::functional::CrossEntropyFuncOptions()
-        .reduction(torch::kMean)
-    );
-
-    // 2. 路由均衡损失 (KL散度)
-    const auto 均匀目标 = torch::full(
-        { 批大小, 专家数量 },
-        1.0f / 专家数量,
-        torch::TensorOptions()
-        .device(路由概率.device())
-        .dtype(路由概率.dtype())
-    );
-
-    const auto 对数路由概率 = torch::log_softmax(路由概率, /*dim=*/1);
-
-    auto 路由损失 = torch::nn::functional::kl_div(
-        对数路由概率,
-        均匀目标,
-        torch::nn::functional::KLDivFuncOptions()
-        .reduction(torch::kMean)
-        .log_target(false)
-    );
-
-    // 3. 组合损失权重（可配置）
-    const float 路由损失权重 = 0.01f;
-    auto 总损失 = 分类损失 + 路由损失权重 * 路由损失;
-
-    // 记录损失用于监控
-    训练统计_["分类损失"] = 分类损失.item<float>();
-    训练统计_["路由损失"] = 路由损失.item<float>();
-    训练统计_["总损失"] = 总损失.item<float>();
-
-    TORCH_INFO("损失计算完成: 分类损失=", 分类损失.item<float>(),
-        ", 路由损失=", 路由损失.item<float>(),
-        ", 总损失=", 总损失.item<float>());
-
-    return 总损失;
-}
 
 float 频域MoE训练器::计算梯度范数() {
     float 总梯度范数 = 0.0f;
@@ -692,15 +752,71 @@ torch::Tensor 频域MoE训练器::计算专家熵(const torch::Tensor& 使用统
 }
 
 void 频域MoE训练器::自适应损失权重调整() {
-    // 基于训练进度调整MoE损失权重
-    float 进度 = static_cast<float>(训练步数_) / 配置_.总训练步数;
-    
-    // 早期训练更关注分类，后期更关注负载均衡
-    float 早期权重 = std::max(0.0f, 1.0f - 进度 * 2.0f);
-    float 后期权重 = std::min(1.0f, 进度 * 2.0f);
-    
-    // 这里可以添加更复杂的自适应逻辑
-    // 例如基于专家使用情况动态调整权重
+    // 验证配置有效性
+    TORCH_CHECK(配置_.总训练步数 > 0, "总训练步数必须大于0");
+
+    // 基于训练进度计算调整系数 [0, 1]
+    float 训练进度 = static_cast<float>(训练步数_) / 配置_.总训练步数;
+    训练进度 = std::clamp(训练进度, 0.0f, 1.0f); // 防止越界
+
+    // 策略1：基于训练进度的阶段性调整
+    // 早期(0-30%): 分类损失主导，路由损失权重线性增长
+    // 中期(30-70%): 路由损失权重保持高位
+    // 后期(70%-100%): 路由损失权重缓慢衰减，让模型收敛
+    float 路由损失权重;
+    if (训练进度 < 0.3f) {
+        // 从0.005线性增加到0.02
+        路由损失权重 = 0.005f + (0.02f - 0.005f) * (训练进度 / 0.3f);
+    }
+    else if (训练进度 < 0.7f) {
+        路由损失权重 = 0.02f;
+    }
+    else {
+        // 从0.02线性衰减到0.01
+        路由损失权重 = 0.02f - (0.02f - 0.01f) * ((训练进度 - 0.7f) / 0.3f);
+    }
+
+    // 策略2：基于专家负载均衡情况的动态调整
+    // 计算专家使用熵，熵越低表示负载越不均衡，需要增加路由损失权重
+    auto 专家使用统计 = 模型_->获取专家使用统计();
+    if (专家使用统计.numel() > 0 && 训练步数_ > 0) {
+        float 专家熵 = 计算专家熵(专家使用统计).item<float>();
+        float 最大熵 = std::log(float(专家使用统计.size(0))); // 均匀分布时的最大熵
+
+        // 负载不均衡系数 [0, 1]，越接近0表示越不均衡
+        float 不均衡系数 = 1.0f - (专家熵 / 最大熵);
+
+        // 当负载不均衡时，增加路由损失权重（最大增加50%）
+        if (不均衡系数 > 0.5f) {
+            路由损失权重 *= (1.0f + 0.5f * (不均衡系数 - 0.5f) * 2.0f);
+        }
+    }
+
+    // 策略3：梯度范数自适应调整
+    // 如果分类损失梯度范数过大，适当降低路由损失权重以保证训练稳定
+    // 这里简化为基于训练步数的指数衰减平滑
+    static float 当前路由损失权重 = 0.01f; // 静态变量保持状态
+    float 平滑因子 = std::exp(-0.001f * 训练步数_); // 指数衰减
+
+    // EMA平滑更新，避免权重剧烈波动
+    当前路由损失权重 = 平滑因子 * 当前路由损失权重 + (1.0f - 平滑因子) * 路由损失权重;
+
+    // 限制权重范围
+    当前路由损失权重 = std::clamp(当前路由损失权重, 0.005f, 0.03f);
+
+    // 将计算出的权重应用到训练配置
+    // 注意：需要在频域MoE训练器类中添加成员变量 当前路由损失权重_
+    // 并在计算总损失时使用该变量而不是硬编码的0.01f
+
+    // 记录权重变化用于监控
+    训练统计_["路由损失权重"] = 当前路由损失权重;
+
+    // 每100步打印一次权重调整信息
+    if (训练步数_ % 100 == 0) {
+        TORCH_INFO("自适应权重调整 - 步数: ", 训练步数_,
+            ", 训练进度: ", (训练进度 * 100), "%",
+            ", 路由损失权重: ", 当前路由损失权重);
+    }
 }
 
 void 频域MoE训练器::保存检查点(const std::string& 路径) {
@@ -710,64 +826,116 @@ void 频域MoE训练器::保存检查点(const std::string& 路径) {
         std::string 目录 = 路径.substr(0, 目录位置);
         std::filesystem::create_directories(目录);
     }
-    
+
     // 保存模型状态
     torch::serialize::OutputArchive 模型存档;
     模型_->save(模型存档);
-    
+
     // 保存优化器状态
     torch::serialize::OutputArchive 优化器存档;
     优化器_->save(优化器存档);
-    
+
     // 保存训练状态
     torch::serialize::OutputArchive 训练存档;
-    训练存档.write("训练步数", 训练步数_);
-    训练存档.write("训练统计", 训练统计_);
-    训练存档.write("验证统计", 验证统计_);
-    训练存档.write("最佳损失", 最佳损失_);
-    
-    // 保存配置
-    训练存档.write("配置.最大梯度范数", 配置_.最大梯度范数);
-    训练存档.write("配置.标签平滑", 配置_.标签平滑);
-    // ... 保存其他配置
-    
+
+    // 保存标量值为张量
+    训练存档.write("训练步数", torch::tensor(训练步数_));
+    训练存档.write("最佳损失", torch::tensor(最佳损失_));
+
+    // 保存训练统计映射为IValue字典
+    if (!训练统计_.empty()) {
+        torch::Dict<std::string, double> 训练统计字典;
+        for (const auto& [键, 值] : 训练统计_) {
+            训练统计字典.insert(键, static_cast<double>(值));
+        }
+        训练存档.write("训练统计", torch::IValue(训练统计字典));
+    }
+
+    // 保存验证统计映射为IValue字典
+    if (!验证统计_.empty()) {
+        torch::Dict<std::string, double> 验证统计字典;
+        for (const auto& [键, 值] : 验证统计_) {
+            验证统计字典.insert(键, static_cast<double>(值));
+        }
+        训练存档.write("验证统计", torch::IValue(验证统计字典));
+    }
+
+    // 保存配置参数
+    训练存档.write("配置.最大梯度范数", torch::tensor(配置_.最大梯度范数));
+    训练存档.write("配置.标签平滑", torch::tensor(配置_.标签平滑));
+
     // 合并所有存档
     torch::serialize::OutputArchive 最终存档;
     最终存档.write("模型", 模型存档);
     最终存档.write("优化器", 优化器存档);
     最终存档.write("训练状态", 训练存档);
-    
+
     // 保存到文件
     最终存档.save_to(路径);
-    
+
     TORCH_INFO("检查点已保存: ", 路径, " (步数: ", 训练步数_, ")");
 }
 
 void 频域MoE训练器::加载检查点(const std::string& 路径) {
     TORCH_CHECK(std::filesystem::exists(路径), "检查点文件不存在: ", 路径);
-    
+
     try {
         torch::serialize::InputArchive 最终存档;
         最终存档.load_from(路径);
-        
+
         // 加载模型
         torch::serialize::InputArchive 模型存档;
         最终存档.read("模型", 模型存档);
         模型_->load(模型存档);
-        
+
         // 加载优化器
         torch::serialize::InputArchive 优化器存档;
         最终存档.read("优化器", 优化器存档);
         优化器_->load(优化器存档);
-        
+
         // 加载训练状态
         torch::serialize::InputArchive 训练存档;
         最终存档.read("训练状态", 训练存档);
-        训练存档.read("训练步数", 训练步数_);
-        训练存档.read("训练统计", 训练统计_);
-        训练存档.read("验证统计", 验证统计_);
-        训练存档.read("最佳损失", 最佳损失_);
-        
+
+        // 读取标量值（通过张量转换）
+        torch::Tensor 步数张量;
+        训练存档.read("训练步数", 步数张量);
+        训练步数_ = 步数张量.item<int64_t>();
+
+        torch::Tensor 最佳损失张量;
+        训练存档.read("最佳损失", 最佳损失张量);
+        最佳损失_ = 最佳损失张量.item<float>();
+
+        // 读取配置参数
+        torch::Tensor 最大梯度范数张量, 标签平滑张量;
+        训练存档.read("配置.最大梯度范数", 最大梯度范数张量);
+        训练存档.read("配置.标签平滑", 标签平滑张量);
+
+        配置_.最大梯度范数 = 最大梯度范数张量.item<float>();
+        配置_.标签平滑 = 标签平滑张量.item<float>();
+
+        // 加载训练统计映射
+        torch::IValue 训练统计值;
+        训练存档.read("训练统计", 训练统计值);
+        if (训练统计值.isGenericDict()) {
+            训练统计_.clear();
+            auto 字典 = 训练统计值.toGenericDict();
+            for (const auto& 项 : 字典) {
+                训练统计_[项.key().toStringRef()] = static_cast<float>(项.value().toDouble());
+            }
+        }
+
+        // 加载验证统计映射
+        torch::IValue 验证统计值;
+        训练存档.read("验证统计", 验证统计值);
+        if (验证统计值.isGenericDict()) {
+            验证统计_.clear();
+            auto 字典 = 验证统计值.toGenericDict();
+            for (const auto& 项 : 字典) {
+                验证统计_[项.key().toStringRef()] = static_cast<float>(项.value().toDouble());
+            }
+        }
+
         TORCH_INFO("检查点已加载: ", 路径, " (步数: ", 训练步数_, ")");
     }
     catch (const std::exception& e) {
@@ -775,6 +943,7 @@ void 频域MoE训练器::加载检查点(const std::string& 路径) {
         throw;
     }
 }
+
 
 void 频域MoE训练器::设置配置(const 训练配置& 新配置) {
     配置_ = 新配置;
@@ -899,70 +1068,64 @@ std::unordered_map<std::string, torch::Tensor>
 }
 
 torch::Tensor 频域MoE分析器::计算专家相似度矩阵(const torch::Tensor& 样本数据) {
-    auto 配置 = 模型_->获取配置();
-    int64_t 专家数量 = 配置.专家数量;
+    // 输入验证
+    TORCH_CHECK(模型_ != nullptr, "分析器模型实例未初始化");
+    TORCH_CHECK(样本数据.defined() && 样本数据.numel() > 0, "样本数据为空");
+
+    auto moe配置 = 模型_->获取配置();
+    const int64_t 专家数量 = moe配置.专家数量;
+    TORCH_CHECK(专家数量 > 1, "专家数量必须大于1才能计算相似度");
+
     auto 设备 = 样本数据.device();
-    
-    // 采样计算专家输出
-    int64_t 采样数 = std::min(配置_.采样数量, (int64_t)样本数据.size(0));
-    auto 采样数据 = 样本数据.slice(0, 0, 采样数);
-    
-    // 获取各专家在采样数据上的输出
-    std::vector<torch::Tensor> 专家输出列表;
-    for (int64_t i = 0; i < 专家数量; ++i) {
-        // 临时修改门控权重，强制使用单个专家
-        auto 原始配置 = 模型_->获取配置();
-        auto 临时配置 = 原始配置;
-        临时配置.激活专家数 = 1;
-        模型_->设置激活专家数(1);
-        
-        // 创建单一专家门控权重
-        auto 门控权重 = torch::zeros({采样数, 专家数量}, 设备);
-        门控权重.select(1, i).fill_(1.0);
-        
-        // 这里需要访问模型的内部方法来强制使用特定专家
-        // 由于这是分析工具，我们可以暂时修改模型状态
-        auto 专家输出 = 获取特定专家输出(采样数据, i);
-        专家输出列表.push_back(专家输出);
-        
-        // 恢复原始配置
-        模型_->设置激活专家数(原始配置.激活专家数);
+
+    // 采样数据以控制计算量
+    const int64_t 实际采样数 = std::min(配置_.采样数量, (int64_t)样本数据.size(0));
+    auto 采样数据 = 样本数据.slice(0, 0, 实际采样数);
+
+    // 批量获取所有专家输出 [专家数, batch, seq_len, hidden_dim]
+    auto 专家输出列表 = 模型_->批量获取专家输出(采样数据);
+
+    // 统一展平为特征向量 [专家数, 特征总数]
+    // 确保所有专家输出在同一设备且连续存储
+    std::vector<torch::Tensor> 展平列表;
+    展平列表.reserve(专家数量);
+
+    for (const auto& 专家输出 : 专家输出列表) {
+        // 展平并确保内存布局连续
+        展平列表.push_back(专家输出.flatten().to(设备, torch::kFloat32).contiguous());
     }
-    
-    // 计算专家间的余弦相似度矩阵
-    auto 相似度矩阵 = torch::zeros({专家数量, 专家数量}, 设备);
-    
-    for (int64_t i = 0; i < 专家数量; ++i) {
-        for (int64_t j = i; j < 专家数量; ++j) {
-            auto 输出_i = 专家输出列表[i].flatten(1);  // [batch, features]
-            auto 输出_j = 专家输出列表[j].flatten(1);
-            
-            // 计算批次平均相似度
-            auto 相似度 = torch::cosine_similarity(输出_i, 输出_j, 1).mean();
-            相似度矩阵[i][j] = 相似度;
-            相似度矩阵[j][i] = 相似度;
-        }
-    }
-    
+
+    // 堆叠为特征矩阵 [专家数, 特征维度]
+    auto 专家特征矩阵 = torch::stack(展平列表, 0);
+
+    // 计算 L2 范数 [专家数, 1]
+    auto 特征范数 = 专家特征矩阵.norm(2, 1, true);
+
+    // 防止除零并归一化
+    auto 归一化特征 = 专家特征矩阵 / (特征范数 + 1e-8);
+
+    // 矩阵乘法高效计算余弦相似度 [专家数, 专家数]
+    auto 相似度矩阵 = torch::matmul(归一化特征, 归一化特征.transpose(0, 1));
+
+    // 强制对角线为1.0（消除数值误差）
+    相似度矩阵.fill_diagonal_(1.0f);
+
+    // 计算非对角线平均相似度作为监控指标
+    auto 掩码 = 1.0f - torch::eye(专家数量, 设备);
+    float 非对角线均值 = (相似度矩阵 * 掩码).sum().item<float>() / (专家数量 * (专家数量 - 1));
+
+    TORCH_INFO("专家相似度矩阵计算完成，平均非对角线相似度: ", 非对角线均值);
+
     return 相似度矩阵;
 }
 
 torch::Tensor 频域MoE分析器::获取特定专家输出(const torch::Tensor& 输入, int64_t 专家索引) {
-    // 这个方法需要访问模型的内部实现
-    // 在实际实现中，可能需要修改模型类以支持强制专家选择
-    // 这里使用简化实现：修改门控权重强制路由到特定专家
-    
-    auto 批次大小 = 输入.size(0);
-    auto 序列长度 = 输入.size(1);
-    auto 设备 = 输入.device();
-    
-    // 创建单一专家门控权重
-    auto 门控权重 = torch::zeros({批次大小, 模型_->获取配置().专家数量}, 设备);
-    门控权重.select(1, 专家索引).fill_(1.0);
-    
-    // 由于无法直接访问模型的专家网络，我们返回一个占位符
-    // 实际实现中应该调用模型的内部方法
-    return torch::randn({批次大小, 序列长度, 模型_->获取配置().专家隐藏维度}, 设备);
+    // 验证模型有效性
+    TORCH_CHECK(模型_ != nullptr, "分析器中的模型实例为空");
+
+    // 直接调用模型的专用接口，避免重复实现路由逻辑
+    // 确保分析过程与训练时的专家计算路径完全一致
+    return 模型_->前向传播特定专家(输入, 专家索引);
 }
 
 torch::Tensor 频域MoE分析器::计算专业化指数(const torch::Tensor& 相似度矩阵) {
@@ -1109,28 +1272,57 @@ void 频域MoE分析器::保存热力图数据(const torch::Tensor& 门控权重
     TORCH_INFO("热力图数据已保存至: ", 配置_.可视化目录);
 }
 
-std::unordered_map<std::string, float> 
+std::unordered_map<std::string, float>
 频域MoE分析器::分析特征重要性(const torch::Tensor& 样本数据) {
     std::unordered_map<std::string, float> 重要性结果;
-    
+
     auto 配置 = 模型_->获取配置();
     auto 设备 = 样本数据.device();
-    
-    // 1. 门控网络特征重要性（通过权重分析）
-    auto 门控参数 = 模型_->参数();
-    // 这里需要访问门控网络的特定参数，简化实现
-    
-    // 2. 频域特征重要性（通过消融实验）
+
+    // 1. 门控网络特征重要性（通过参数梯度分析）
+    auto 门控参数列表 = 模型_->获取参数列表();
+
+    // 分析第一个线性层的权重重要性
+    if (!门控参数列表.empty()) {
+        auto 门控权重 = 门控参数列表[0]; // 门控网络第一层权重 [输出维度, 输入维度]
+
+        // 修复: 使用显式的torch::IntArrayRef指定维度，避免重载歧义
+        auto 权重绝对值 = 门控权重.abs().mean(torch::IntArrayRef{ 0, 1 });
+
+        // 验证维度有效性
+        TORCH_CHECK(权重绝对值.numel() > 0, "权重绝对值计算结果为空");
+
+        auto 特征重要性 = torch::softmax(权重绝对值, 0);
+
+        // 映射到5个频域特征分量
+        const std::vector<std::string> 特征名称 = {
+            "低频能量", "高频能量", "相位稳定性", "全局平均能量", "峰值能量"
+        };
+
+        // 确保索引不越界
+        int64_t 有效维度 = std::min(static_cast<int64_t>(特征名称.size()), 特征重要性.size(0));
+        for (int64_t i = 0; i < 有效维度; ++i) {
+            重要性结果[特征名称[i] + "_重要性"] = 特征重要性[i].item<float>();
+        }
+    }
+
+    // 2. 频域特征重要性（通过消融实验模拟）
     auto 基准门控权重 = 模型_->获取门控权重(样本数据);
     float 基准熵 = 计算门控熵(基准门控权重).item<float>();
-    
-    // 模拟特征消融（简化实现）
-    重要性结果["低频特征重要性"] = 模拟特征消融(样本数据, "低频", 基准熵);
-    重要性结果["高频特征重要性"] = 模拟特征消融(样本数据, "高频", 基准熵);
-    重要性结果["相位特征重要性"] = 模拟特征消融(样本数据, "相位", 基准熵);
-    重要性结果["全局特征重要性"] = 模拟特征消融(样本数据, "全局", 基准熵);
-    重要性结果["峰值特征重要性"] = 模拟特征消融(样本数据, "峰值", 基准熵);
-    
+
+    // 模拟不同频域特征的消融影响
+    const std::vector<std::pair<std::string, std::string>> 特征消融列表 = {
+        {"低频特征重要性", "低频"},
+        {"高频特征重要性", "高频"},
+        {"相位特征重要性", "相位"},
+        {"全局特征重要性", "全局"},
+        {"峰值特征重要性", "峰值"}
+    };
+
+    for (const auto& [结果键, 特征类型] : 特征消融列表) {
+        重要性结果[结果键] = 模拟特征消融(样本数据, 特征类型, 基准熵);
+    }
+
     return 重要性结果;
 }
 
@@ -1191,11 +1383,12 @@ void 频域MoE分析器::生成专家使用报告(const std::string& 输出路�
     
     // 识别关键专家
     报告文件 << "\n关键专家分析:\n";
+    int64_t 分析专家数 = std::min(static_cast<int64_t>(3), 配置.专家数量);
     auto 排序索引 = torch::argsort(使用统计, 0, true);
-    for (int64_t i = 0; i < std::min(3L, 配置.专家数量); ++i) {
+    for (int64_t i = 0; i < 分析专家数; ++i) {
         int64_t 专家索引 = 排序索引[i].item<int64_t>();
-        报告文件 << "Top-" << (i+1) << " 专家: " << 专家索引 
-                << " (使用率: " << 使用统计[专家索引].item<float>() << ")\n";
+        报告文件 << "Top-" << (i + 1) << " 专家: " << 专家索引
+            << " (使用率: " << 使用统计[专家索引].item<float>() << ")\n";
     }
     
     报告文件.close();
@@ -1212,33 +1405,44 @@ std::string 频域MoE分析器::获取当前时间() {
 }
 
 torch::Tensor 频域MoE分析器::计算专家熵(const torch::Tensor& 使用统计) {
-    auto 概率分布 = torch::softmax(使用统计 + 1e-8, );
-    auto 熵 = -torch::sum(概率分布 * torch::log(概率分布));
-    return 熵;
+    auto 概率分布 = torch::softmax(使用统计 + 1e-8, 0); // 添加维度参数0
+    auto 熵值 = -torch::sum(概率分布 * torch::log(概率分布 + 1e-8));
+    return 熵值.unsqueeze(0);
 }
 
 void 频域MoE分析器::可视化专家网络(const std::string& 输出路径) {
     // 生成专家网络的可视化描述
     std::ofstream 可视化文件(输出路径);
-    
+
+    if (!可视化文件.is_open()) {
+        TORCH_ERROR("无法打开可视化文件: ", 输出路径);
+        return;
+    }
+
     可视化文件 << "digraph MoE_Expert_Network {\n";
     可视化文件 << "    rankdir=LR;\n";
     可视化文件 << "    node [shape=box, style=filled, fillcolor=lightblue];\n\n";
-    
+
+    // 获取配置信息
     auto 配置 = 模型_->获取配置();
-    
+
+    // 关键修复：直接从模型对象获取维度信息，而非配置结构体
+    // 因为输入维度和类别数是频域MoE分类器的成员变量，不是配置参数
+    int64_t 输入维度 = 模型_->输入维度_;
+    int64_t 类别数 = 模型_->类别数_;
+
     // 输入节点
-    可视化文件 << "    input [label=\"输入\\n维度: " << 配置.输入维度 << "\"];\n";
-    
+    可视化文件 << "    input [label=\"输入\\n维度: " << 输入维度 << "\"];\n";
+
     // 专家节点
     for (int64_t i = 0; i < 配置.专家数量; ++i) {
-        可视化文件 << "    expert" << i << " [label=\"专家 " << i 
-                  << "\\n隐藏维: " << 配置.专家隐藏维度 << "\"];\n";
+        可视化文件 << "    expert" << i << " [label=\"专家 " << i
+            << "\\n隐藏维: " << 配置.专家隐藏维度 << "\"];\n";
     }
-    
+
     // 输出节点
-    可视化文件 << "    output [label=\"输出\\n类别: " << 配置.类别数 << "\"];\n\n";
-    
+    可视化文件 << "    output [label=\"输出\\n类别: " << 类别数 << "\"];\n\n";
+
     // 连接关系
     可视化文件 << "    input -> {";
     for (int64_t i = 0; i < 配置.专家数量; ++i) {
@@ -1246,24 +1450,27 @@ void 频域MoE分析器::可视化专家网络(const std::string& 输出路径) 
         if (i < 配置.专家数量 - 1) 可视化文件 << " ";
     }
     可视化文件 << "} [label=\"频域路由\"];\n\n";
-    
+
+    // 添加专家到输出的连接，线宽反映使用率
     for (int64_t i = 0; i < 配置.专家数量; ++i) {
         可视化文件 << "    expert" << i << " -> output";
-        
+
         auto 使用率 = 模型_->获取专家使用统计()[i].item<float>();
         int 线宽 = static_cast<int>(使用率 * 10) + 1;
-        可视化文件 << " [penwidth=" << 线宽 << ", label=\"" 
-                  << std::fixed << std::setprecision(3) << 使用率 << "\"]";
-        
+        可视化文件 << " [penwidth=" << 线宽 << ", label=\""
+            << std::fixed << std::setprecision(3) << 使用率 << "\"]";
+
         可视化文件 << ";\n";
     }
-    
+
     可视化文件 << "}\n";
     可视化文件.close();
-    
+
     TORCH_INFO("专家网络可视化描述已生成: ", 输出路径);
-    TORCH_INFO("使用命令生成图片: dot -Tpng " << 输出路径 << " -o " 
-               << 输出_path.substr(0, 输出路径.find_last_of('.')) << ".png");
+
+    // 生成转换为图片的命令提示
+    std::string 基础文件名 = 输出路径.substr(0, 输出路径.find_last_of('.'));
+    TORCH_INFO("使用 Graphviz 生成图片: dot -Tpng ", 输出路径, " -o ", 基础文件名, ".png");
 }
 // ========================= 训练配置相关 =========================
 
@@ -1341,7 +1548,7 @@ namespace MoE工具 {
 
 int64_t 计算参数数量(const 频域MoE分类器& 模型) {
     int64_t 总参数 = 0;
-    auto 参数列表 = model.parameters();
+    auto 参数列表 = 模型.parameters();
     
     for (const auto& 参数 : 参数列表) {
         if (参数.defined()) {

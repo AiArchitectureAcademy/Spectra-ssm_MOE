@@ -124,7 +124,19 @@ public:
             "错误: 必须先执行前向传播才能获取路由概率");
         return 最后路由概率_;
     }
-
+    /**
+ * @brief 获取所有可训练参数列表
+ * @return 参数张量列表
+ */
+    std::vector<torch::Tensor> 获取参数列表() {
+        std::vector<torch::Tensor> 参数向量;
+        for (const auto& 参数句柄 : parameters()) {
+            if (参数句柄.defined()) {
+                参数向量.push_back(参数句柄);
+            }
+        }
+        return 参数向量;
+    }
     /**
      * @brief 重置专家缓存
      */
@@ -139,15 +151,32 @@ public:
      * @brief 设置激活专家数（动态调整）
      */
     void 设置激活专家数(int64_t 新激活专家数);
+    /**
+     * @brief 提取频域特征用于路由决策
+     */
+    torch::Tensor 提取频域特征(const torch::Tensor& 输入) const;
+   /**
+ * @brief 强制使用特定专家进行前向传播（分析用）
+ * @param 输入 输入张量
+ * @param 专家索引 指定的专家索引
+ * @return 指定专家的输出
+ */
+    torch::Tensor 前向传播特定专家(const torch::Tensor& 输入, int64_t 专家索引);
+   std::vector<torch::Tensor> 批量获取专家输出(const torch::Tensor& 输入);
 
-private:
     int64_t 输入维度_;
     int64_t 类别数_;
+private:
+
     频域MoE配置 配置_;
 
     // 专家网络池
     std::vector<std::shared_ptr<频域MoE模型>> 专家网络_;
+    // 专家专业化引导参数
+    std::vector<torch::Tensor> 专家频域偏置_;  // 每个专家的频域偏置
 
+    // 可学习的频域偏置缩放参数
+    torch::Tensor 频域偏置缩放_;  // 控制专家专业化偏置的强度
     // 门控网络
     torch::nn::Sequential 门控网络_{ nullptr };
     torch::nn::Dropout 门控Dropout_{ nullptr };
@@ -180,10 +209,7 @@ private:
      */
     void 初始化门控网络();
 
-    /**
-     * @brief 提取频域特征用于路由决策
-     */
-    torch::Tensor 提取频域特征(const torch::Tensor& 输入) const;
+
 
     /**
      * @brief 计算门控权重（包含Top-K稀疏化）
@@ -214,7 +240,8 @@ private:
      * @brief 清空专家缓存
      */
     void 清空专家缓存();
-};
+ 
+ };
 
 
 /**
@@ -279,7 +306,7 @@ private:
     std::unordered_map<std::string, float> 验证统计_;
     float 最佳损失_ = std::numeric_limits<float>::max();
     int64_t 无改善轮数_ = 0;
-
+    float 当前路由损失权重_ = 0.01f;  ///< 动态调整的路由损失权重
     std::shared_ptr<频域MoE分类器> 模型_;  // 修复：shared_ptr
     std::shared_ptr<torch::optim::Optimizer> 优化器_;  // 修复：shared_ptr
     torch::Device 设备_;
@@ -322,7 +349,7 @@ public:
      * @brief 分析专家专业化程度
      * @return 专家专业化度量和可视化数据
      */
-    std::unordered_map<std::string, torch::Tensor> 分析专家专业化();
+    std::unordered_map<std::string, torch::Tensor> 分析专家专业化(const torch::Tensor& 样本数据);
 
     /**
      * @brief 生成路由热力图
@@ -334,40 +361,33 @@ public:
     /**
      * @brief 分析频域特征重要性
      */
-    std::unordered_map<std::string, float> 分析特征重要性();
+    std::unordered_map<std::string, float> 分析特征重要性(const torch::Tensor& 样本数据);
 
     /**
      * @brief 生成专家使用报告
      */
-    void 生成专家使用报告();
+    void 生成专家使用报告(const std::string& 输出路径);
 
 private:
-    std::unordered_map<std::string, torch::Tensor> 分析专家专业化(const torch::Tensor& 样本数据);
+    std::shared_ptr<频域MoE分类器> 模型_;
+
+    分析配置 配置_;// 分析配置参数存储
+
     // 私有方法
     torch::Tensor 计算专家相似度矩阵(const torch::Tensor& 样本数据);
     torch::Tensor 获取特定专家输出(const torch::Tensor& 输入, int64_t 专家索引);
     torch::Tensor 计算专业化指数(const torch::Tensor& 相似度矩阵);
     std::tuple<torch::Tensor, torch::Tensor> 分析频域响应特性(const torch::Tensor& 样本数据);
-    std::vector<torch::Tensor> 生成多频段测试信号(int64_t 批次大小, int64_t 序列长度, 
-                                               int64_t 特征维度, int64_t 频段数, torch::Device 设备);
+    std::vector<torch::Tensor> 生成多频段测试信号(int64_t 批次大小, int64_t 序列长度,
+        int64_t 特征维度, int64_t 频段数, torch::Device 设备);
     torch::Tensor 分析路由稳定性(const torch::Tensor& 样本数据);
-    void 保存热力图数据(const torch::Tensor& 门控权重, const torch::Tensor& 输入样本);
+    void 保存热力图数据(const torch::Tensor& 门控权重,
+        const torch::Tensor& 输入样本);
     float 模拟特征消融(const torch::Tensor& 样本数据, const std::string& 特征类型, float 基准熵);
     torch::Tensor 计算门控熵(const torch::Tensor& 门控权重);
     std::string 获取当前时间();
     torch::Tensor 计算专家熵(const torch::Tensor& 使用统计);
     void 可视化专家网络(const std::string& 输出路径);
-    std::shared_ptr<频域MoE分类器> 模型_;
-
-    /**
-     * @brief 计算专家输出相似度矩阵
-     */
-    torch::Tensor 计算专家相似度矩阵();
-
-    /**
-     * @brief 分析频段响应特性
-     */
-    std::vector<float> 分析频段响应();
 };
 
 // 工具函数

@@ -70,6 +70,9 @@ namespace SpectraSSM {
         void 步数递增() override { 步数_++; }
 
     private:
+        bool 使用零拷贝模式_ = false;  ///< 核显专用模式标记
+        vk::DeviceSize 当前内存使用量_ = 0;  ///< 内存使用监控
+        const vk::DeviceSize 最大显存预算_ = 400 * 1024 * 1024;  ///< 预留100MB给系统，只使用400MB
         // Vulkan 对象
         vk::Instance 实例_;
         vk::Device 逻辑设备_;
@@ -127,6 +130,10 @@ namespace SpectraSSM {
         void 创建计算管线();
         void 创建参数缓冲(const std::string& 参数名, size_t 元素数量);
         void 上传张量数据(const torch::Tensor& 张量, vk::Buffer 目标缓冲);
+        vk::CommandBuffer 开始单次命令();
+        void 结束并提交命令(vk::CommandBuffer 命令缓冲);
+        vk::DeviceMemory 获取缓冲关联内存(vk::Buffer 缓冲);
+        uint32_t 查找零拷贝内存类型(const vk::MemoryRequirements& 需求);
         void 下载张量数据(torch::Tensor& 张量, vk::Buffer 源缓冲);
         void 执行GPU优化(const std::string& 参数名);
         void 更新Uniform缓冲区();

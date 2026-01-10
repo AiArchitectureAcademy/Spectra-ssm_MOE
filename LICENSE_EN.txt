@@ -28,7 +28,7 @@
 ## 3. Free Use Eligibility and Restrictions
 
 **3.1** The free license under this Agreement applies only if:
-**Your annual Revenue does not exceed 7,000,000 RMB (Seven Million Yuan).**
+**Your annual Revenue does not exceed 5,000,000 RMB (Seven Million Yuan).**
 
 **3.2** Once Your Revenue exceeds the above threshold, You must, within **30 calendar days**, either:
    (a) Purchase a valid SpectraSSM Commercial License; or  

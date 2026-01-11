@@ -47,11 +47,5 @@ SpectraSSM核心
     └── 内存高效管理
 ```
 
-## 🚀 快速开始
 
-### 环境要求
-- C++20兼容编译器 (GCC 11+, Clang 12+, MSVC 19.30+)
-- PyTorch 2.0+
-- Vulkan SDK 1.2+
-- CUDA 11.0+ (可选，推荐)
 

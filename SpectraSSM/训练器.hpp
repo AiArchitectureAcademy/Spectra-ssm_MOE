@@ -1,4 +1,19 @@
-﻿// SpectraSSM/训练器.hpp
+/*
+ * SpectraSSM - 频域状态空间模型库
+ * 版权所有 © 2026 SpectraSSM 项目所有者
+ * 
+ * 本软件受 SpectraSSM 自定义社区许可协议 v1.0 约束。
+ * 免费使用条件：年营业额 ≤ 5,000,000 人民币。
+ * 完整协议见项目根目录 LICENSE.txt。
+ * 
+ * 警告：此为自定义非开源许可证，包含营收限制和审计条款。
+ * 使用即表示接受所有条件，请在使用前咨询法律顾问。
+ */
+
+#include "spectra_ssm.h"
+
+// ... 代码内容 ...
+// SpectraSSM/训练器.hpp
 #pragma once
 
 #include "SpectraSSM.hpp"

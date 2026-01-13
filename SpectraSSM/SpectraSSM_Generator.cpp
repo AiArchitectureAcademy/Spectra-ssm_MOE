@@ -1,4 +1,14 @@
 ﻿
+// SpectraSSM - 频域状态空间模型库
+// 版权所有 © 2026 SpectraSSM 项目所有者
+// 
+// 本软件受 SpectraSSM 自定义社区许可协议 v1.0 约束，使用需满足：
+// - 年营业额 ≤ 5,000,000 人民币（滚动12个月）
+// - 详见完整协议: LICENSE.txt
+// 
+// 警告：此许可证非开源许可证，包含商业使用限制和审计条款。
+// 使用本软件即表示您同意接受所有条款，包括零责任赔偿限制。
+//
 #include "SpectraSSM_Generator.hpp"
 #include <cmath>
 #include <algorithm>

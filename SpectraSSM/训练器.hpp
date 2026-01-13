@@ -1,4 +1,4 @@
-/*
+
 // SpectraSSM - 频域状态空间模型库
 // 版权所有 © 2026 SpectraSSM 项目所有者
 // 
@@ -12,7 +12,6 @@
 
 #include "spectra_ssm.h"
 
-// ... 代码内容 ...
 // SpectraSSM/训练器.hpp
 #pragma once
 
